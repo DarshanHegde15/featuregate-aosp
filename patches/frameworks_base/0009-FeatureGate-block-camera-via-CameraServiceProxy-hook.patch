@@ -1,0 +1,122 @@
+From b9435e6e09c98078bd23bfe8e31f0f8f3f499f58 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Sun, 1 Nov 2026 13:52:16 +0530
+Subject: [PATCH 09/13] FeatureGate: block camera via CameraServiceProxy hook
+
+CameraServiceProxy.isCameraDisabled() (called by cameraserver on every
+camera open) now also asks FeatureGateInternal; when camera is blocked by a
+battery rule it returns true, cameraserver refuses the open as for a
+device-policy disable, and FeatureGate shows its blocked toast.
+CameraEnforcer records state for logs and dumpsys (preventive only;
+already-open cameras are not closed).
+
+Change-Id: I6e9c6e6ae32ba82fd5607c6dbe4dc6c9bff51f3a
+---
+ .../server/camera/CameraServiceProxy.java     |  8 +++
+ .../server/featuregate/CameraEnforcer.java    | 55 +++++++++++++++++++
+ .../featuregate/FeatureGateService.java       |  1 +
+ 3 files changed, 64 insertions(+)
+ create mode 100644 services/core/java/com/android/server/featuregate/CameraEnforcer.java
+
+diff --git a/services/core/java/com/android/server/camera/CameraServiceProxy.java b/services/core/java/com/android/server/camera/CameraServiceProxy.java
+index 05fc6bc869ca..bd1066465ef7 100644
+--- a/services/core/java/com/android/server/camera/CameraServiceProxy.java
++++ b/services/core/java/com/android/server/camera/CameraServiceProxy.java
+@@ -108,6 +108,9 @@ import java.util.Set;
+ import java.util.concurrent.ScheduledThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+ 
++import android.app.featuregate.FeatureGateManager;
++import com.android.server.featuregate.FeatureGateInternal;
++
+ /**
+  * CameraServiceProxy is the system_server analog to the camera service running in cameraserver.
+  *
+@@ -868,6 +871,11 @@ public class CameraServiceProxy extends SystemService
+ 
+         @Override
+         public boolean isCameraDisabled(int userId) {
++            final FeatureGateInternal featureGate = LocalServices.getService(FeatureGateInternal.class);
++            if(featureGate != null && !featureGate.isFeatureAllowed(FeatureGateManager.FEATURE_CAMERA)) {
++                featureGate.notifyBlocked(FeatureGateManager.FEATURE_CAMERA);
++                return true;
++            }
+             if (Binder.getCallingUid() != Process.CAMERASERVER_UID) {
+                 Slog.e(TAG, "Calling UID: " + Binder.getCallingUid()
+                         + " doesn't match expected camera service UID!");
+diff --git a/services/core/java/com/android/server/featuregate/CameraEnforcer.java b/services/core/java/com/android/server/featuregate/CameraEnforcer.java
+new file mode 100644
+index 000000000000..2d537c69d737
+--- /dev/null
++++ b/services/core/java/com/android/server/featuregate/CameraEnforcer.java
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.featuregate;
++
++import android.app.featuregate.FeatureGateManager;
++import android.util.Slog;
++
++import java.io.PrintWriter;
++import java.util.Set;
++
++/*
++* Camera is enforced PREVENTIVELY: CameraServiceProxy.isCameraDisabled() asks
++* FeatureGateInternal on every camera open. This enforcer only records state for
++* logs and dumpsys; already-open cameras are not closed.
++*/
++final class CameraEnforcer implements FeatureEnforcer{
++    private static final String TAG = "FeatureGate.Camera";
++
++    private boolean mBlocked; // Only touched on the service thread
++
++    @Override
++    public String getName(){
++        return "CameraEnforcer";
++    }
++
++    @Override
++    public Set<String> getHandledFeatures(){
++        return Set.of(FeatureGateManager.FEATURE_CAMERA);
++    }
++
++    @Override
++    public void onFeatureStateChanged(String featureId, boolean allowed){
++        mBlocked = !allowed;
++        Slog.i(TAG, "camera now " + (allowed ? "ALLOWED" : "BLOCKED") + " (enforced at open time via CameraServiceProxy");
++    }
++
++    @Override
++    public void dump(PrintWriter pw) {
++        pw.println("    " + getName() + ": blocked=" + mBlocked + " (preventive hook in CameraServiceProxy.isCameraDisabled)");
++    }
++}
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index 84218660c050..962dbc43dcfa 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -78,6 +78,7 @@ public final class FeatureGateService extends SystemService {
+     public FeatureGateService(Context context) {
+         super(context);
+         registerEnforcer(new SystemUiEnforcer(context));
++        registerEnforcer(new CameraEnforcer());
+         mCatalog = new FeatureCatalog(context);
+         mHandlerThread = new ServiceThread(TAG, Process.THREAD_PRIORITY_BACKGROUND,
+                 false /* allowIo */);
+-- 
+2.53.0
+

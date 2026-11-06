@@ -1,0 +1,215 @@
+From 6b798f6bb207aad3c98a29fc940b85c5711f9aaa Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Sun, 11 Oct 2026 16:22:39 +0530
+Subject: [PATCH 01/13] FeatureGate: add AIDL interfaces and FeatureRule
+ parcelable
+
+Adds IFeatureGateManager (service interface), IFeatureGateListener
+(oneway callback) and FeatureRule (Parcelable), all @hide.
+Adds Context.FEATURE_GATE_SERVICE constant.
+
+Change-Id: I6e54926ea76f6e99f5872587cb59ab11d111c03d
+---
+ .../android/app/featuregate/FeatureRule.aidl  |   4 +
+ .../android/app/featuregate/FeatureRule.java  | 102 ++++++++++++++++++
+ .../app/featuregate/IFeatureGateListener.aidl |  15 +++
+ .../app/featuregate/IFeatureGateManager.aidl  |  27 +++++
+ core/java/android/content/Context.java        |   6 ++
+ 5 files changed, 154 insertions(+)
+ create mode 100644 core/java/android/app/featuregate/FeatureRule.aidl
+ create mode 100644 core/java/android/app/featuregate/FeatureRule.java
+ create mode 100644 core/java/android/app/featuregate/IFeatureGateListener.aidl
+ create mode 100644 core/java/android/app/featuregate/IFeatureGateManager.aidl
+
+diff --git a/core/java/android/app/featuregate/FeatureRule.aidl b/core/java/android/app/featuregate/FeatureRule.aidl
+new file mode 100644
+index 000000000000..2f7fb2c3d278
+--- /dev/null
++++ b/core/java/android/app/featuregate/FeatureRule.aidl
+@@ -0,0 +1,4 @@
++package android.app.featuregate;
++
++/** @hide */
++parcelable FeatureRule;
+diff --git a/core/java/android/app/featuregate/FeatureRule.java b/core/java/android/app/featuregate/FeatureRule.java
+new file mode 100644
+index 000000000000..ccd41715086d
+--- /dev/null
++++ b/core/java/android/app/featuregate/FeatureRule.java
+@@ -0,0 +1,102 @@
++package android.app.featuregate;
++
++import android.annotation.NonNull;
++import android.os.Parcel;
++import android.os.Parcelable;
++import java.util.Objects;
++
++/*
++ * A rule saying when a feature is allowed based on battery percenntage. 
++ * Custom Parcel implementation.
++ */
++
++/** @hide */
++public final class FeatureRule implements Parcelable {
++
++@NonNull private final String mFeatureId;
++private final int mMinBatteryPercent;
++private final boolean mAllowWhenCharging;
++
++    public FeatureRule(@NonNull String featureId, int minBatteryPercent, boolean allowWhenCharging) {
++
++        mFeatureId = Objects.requireNonNull(featureId, "featureId");
++        mMinBatteryPercent = minBatteryPercent;
++        mAllowWhenCharging = allowWhenCharging;
++
++    }
++
++    //Unpack: Must read in the same order as writeToParcel writes.
++    private FeatureRule(@NonNull Parcel in) {
++
++        mFeatureId = in.readString8();
++        mMinBatteryPercent = in.readInt();
++        mAllowWhenCharging = in.readBoolean();
++
++    }
++
++    @Override
++    public void writeToParcel(@NonNull Parcel dest, int flags) {
++
++
++        dest.writeString8(mFeatureId);
++        dest.writeInt(mMinBatteryPercent);
++        dest.writeBoolean(mAllowWhenCharging);
++
++    }
++
++    @Override
++    public int describeContents() {
++
++        return 0;
++
++    }
++
++    public static final @NonNull Creator<FeatureRule> CREATOR = new Creator<>() {
++
++        @Override
++        public FeatureRule createFromParcel(Parcel in) {
++
++            return new FeatureRule(in);
++
++        }
++
++        @Override
++        public FeatureRule[] newArray(int size) {
++
++            	return new FeatureRule[size];
++
++        }
++
++    };
++
++    @NonNull public String getFeatureId() { return mFeatureId; }
++    public int getMinBatteryPercent() { return mMinBatteryPercent; }
++    public boolean getAllowWhenCharging() { return mAllowWhenCharging; }
++
++    @Override
++    public boolean equals(Object o) {
++
++        if(this == o) return true;
++        if(!(o instanceof FeatureRule)) return false;
++        FeatureRule other = (FeatureRule) o;
++        return mFeatureId.equals(other.mFeatureId) &&
++               mMinBatteryPercent == other.mMinBatteryPercent &&
++               mAllowWhenCharging == other.mAllowWhenCharging;
++
++    }
++
++    @Override
++    public int hashCode() {
++
++        return Objects.hash(mFeatureId, mMinBatteryPercent, mAllowWhenCharging);
++
++    }
++
++    @Override
++    public String toString() {
++
++        return "FeatureRule{" + mFeatureId + ", minBattery = " + mMinBatteryPercent + "%" + ", allowWhenCharging = " + mAllowWhenCharging + "}";
++
++    }
++
++}
+diff --git a/core/java/android/app/featuregate/IFeatureGateListener.aidl b/core/java/android/app/featuregate/IFeatureGateListener.aidl
+new file mode 100644
+index 000000000000..1d3a93ecba55
+--- /dev/null
++++ b/core/java/android/app/featuregate/IFeatureGateListener.aidl
+@@ -0,0 +1,15 @@
++/*
++ * Listener for featuregate state changes
++ */
++
++package android.app.featuregate;
++
++/*
++ * Called by FeatureGateService when a feature becomes allowed or blocked..
++ * oneway: system_server must never wait on an app.
++ */
++
++/** @hide */
++oneway interface IFeatureGateListener {
++    void onFeatureStateChanged(String featureId, boolean allowed);
++}
+diff --git a/core/java/android/app/featuregate/IFeatureGateManager.aidl b/core/java/android/app/featuregate/IFeatureGateManager.aidl
+new file mode 100644
+index 000000000000..b9104b232bf0
+--- /dev/null
++++ b/core/java/android/app/featuregate/IFeatureGateManager.aidl
+@@ -0,0 +1,27 @@
++package android.app.featuregate;
++
++import android.app.featuregate.FeatureRule;
++import android.app.featuregate.IFeatureGateListener;
++
++/*
++ * Binder interface of FeatureGateService (in system_server).
++ * Apps use FeatureGateManager, never use this interface directly.
++ */
++
++/** @hide */
++interface IFeatureGateManager {
++    /** Error code for SystemSpecificException: no rule exists for this feature */
++    const int ERROR_UNKNOWN_FEATURE = 1;
++
++    //---- Quaries: Open to all apps ----
++    boolean isFeatureAllowed(String featureId);
++    List<FeatureRule> getRules();
++
++    //---- Admin: Will require MANAGE_FEATURE_GATE ----
++    void setRule(in FeatureRule rule);
++    void removeRule(String featureId);
++
++    //---- Live updates ----
++    void registerListener(IFeatureGateListener listener);
++    void unregisterListener(IFeatureGateListener listener);
++}
+diff --git a/core/java/android/content/Context.java b/core/java/android/content/Context.java
+index 6ec6a62ff639..78fcb37a8547 100644
+--- a/core/java/android/content/Context.java
++++ b/core/java/android/content/Context.java
+@@ -4853,6 +4853,12 @@ public abstract class Context {
+     @SuppressLint("ServiceName")
+     public static final String VIBRATOR_MANAGER_SERVICE = "vibrator_manager";
+ 
++    /**
++     * Use with {@link #getSystemService(String)} to receive the FeatureGate service.
++     */
++    /** @hide */
++    public static final String FEATURE_GATE_SERVICE = "feature_gate";
++
+     /**
+      * Use with {@link #getSystemService(String)} to retrieve a {@link android.os.Vibrator} for
+      * interacting with the vibration hardware.
+-- 
+2.53.0
+

@@ -1,0 +1,322 @@
+From 5cf52f069b5db3b3620b5e717fc723ac7ffd2aed Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Mon, 26 Oct 2026 07:40:55 +0530
+Subject: [PATCH 04/13] FeatureGate: feature catalog and rule validation
+
+- FeatureCatalog: only known feature IDs (camera, nav_*, notification_shade,
+  hotspot, wifi, mobile_data) and app:<installed package> are accepted;
+  unknown IDs throw ServiceSpecificException(ERROR_UNKNOWN_FEATURE).
+- Package lookup runs with cleared calling identity, outside the service lock.
+- AIDL: getSupportedFeatures() appended at the end (existing codes unchanged).
+- Manager: feature constants, getSupportedFeatures(), translates the error
+  code into IllegalArgumentException.
+- cmd feature_gate features.
+
+Change-Id: Id9952155674c5986d2549c7ec7d61874c2ce92af
+---
+ .../app/featuregate/FeatureGateManager.java   | 40 ++++++++
+ .../app/featuregate/IFeatureGateManager.aidl  |  3 +
+ .../server/featuregate/FeatureCatalog.java    | 95 +++++++++++++++++++
+ .../featuregate/FeatureGateService.java       | 28 ++++--
+ 4 files changed, 160 insertions(+), 6 deletions(-)
+ create mode 100644 services/core/java/com/android/server/featuregate/FeatureCatalog.java
+
+diff --git a/core/java/android/app/featuregate/FeatureGateManager.java b/core/java/android/app/featuregate/FeatureGateManager.java
+index 23184acf1de1..def5c05bdaa7 100644
+--- a/core/java/android/app/featuregate/FeatureGateManager.java
++++ b/core/java/android/app/featuregate/FeatureGateManager.java
+@@ -32,6 +32,8 @@ import com.android.internal.annotations.GuardedBy;
+ 
+ import java.util.concurrent.Executor;
+ 
++import android.os.ServiceSpecificException;
++
+ /**
+  * Client API for FeatureGateService.
+  * Get it with {@code context.getSystemService(FeatureGateManager.class)}.
+@@ -46,6 +48,20 @@ public class FeatureGateManager {
+     @GuardedBy("mLock")
+     private final ArrayMap<Listener, ListenerTransport> mTransports = new ArrayMap<>();
+ 
++    // ---- Feature catalog (the only IDs FeatureGateService accepts) -----
++    public static final String FEATURE_CAMERA = "camera";
++    public static final String FEATURE_NAV_BACK = "nav_back";
++    public static final String FEATURE_NAV_HOME = "nav_home";
++    public static final String FEATURE_NAV_RECENTS = "nav_recents";
++    public static final String FEATURE_NAV_ALL = "nav_all";
++    public static final String FEATURE_NOTIFICATION_SHADE = "notification_shade";
++    public static final String FEATURE_HOTSPOT = "hotspot";
++    public static final String FEATURE_WIFI = "wifi";
++    public static final String FEATURE_BLUETOOTH = "bluetooth";
++    public static final String FEATURE_MOBILE_DATA = "mobile_data";
++    /** Prefix for app features, e.g "app:com.android.settings." */
++    public static final String APP_PREFIX = "app:";
++
+ 
+     /** @hide */
+     public FeatureGateManager(@NonNull Context context, @NonNull IFeatureGateManager service) {
+@@ -60,6 +76,8 @@ public class FeatureGateManager {
+             return mService.isFeatureAllowed(featureId);
+         } catch (RemoteException e) {
+             throw e.rethrowFromSystemServer();
++        } catch (ServiceSpecificException e) {
++            throw translate(e);
+         }
+     }
+ 
+@@ -80,6 +98,8 @@ public class FeatureGateManager {
+             mService.setRule(rule);
+         } catch (RemoteException e) {
+             throw e.rethrowFromSystemServer();
++        } catch (ServiceSpecificException e) {
++            throw translate(e);
+         }
+     }
+ 
+@@ -90,7 +110,27 @@ public class FeatureGateManager {
+             mService.removeRule(featureId);
+         } catch (RemoteException e) {
+             throw e.rethrowFromSystemServer();
++        }catch (ServiceSpecificException e) {
++            throw translate(e);
++        }
++    }
++
++    /** Returns the feature IDs the service accepts. (plus the "app:<package>" form) */
++    @NonNull
++    public List<String> getSupportedFeatures() {
++        try{
++            return mService.getSupportedFeatures();
++        } catch (RemoteException e) {
++            throw e.rethrowFromSystemServer();
++        }
++    }
++
++    /** Turns the service's error into a normal Java exception for apps. */
++    private static RuntimeException translate(ServiceSpecificException e) {
++        if(e.errorCode == IFeatureGateManager.ERROR_UNKNOWN_FEATURE) {
++            return new IllegalArgumentException(e.getMessage());
+         }
++        return e;
+     }
+ 
+     /** Receives feature state changes. Plain Java interface: apps never see AIDL. */
+diff --git a/core/java/android/app/featuregate/IFeatureGateManager.aidl b/core/java/android/app/featuregate/IFeatureGateManager.aidl
+index b9104b232bf0..67a3b0c98f06 100644
+--- a/core/java/android/app/featuregate/IFeatureGateManager.aidl
++++ b/core/java/android/app/featuregate/IFeatureGateManager.aidl
+@@ -24,4 +24,7 @@ interface IFeatureGateManager {
+     //---- Live updates ----
+     void registerListener(IFeatureGateListener listener);
+     void unregisterListener(IFeatureGateListener listener);
++
++    // ---- Catalog (added in step 5, at the END to keep transaction codes stable) ----
++    List<String> getSupportedFeatures();
+ }
+diff --git a/services/core/java/com/android/server/featuregate/FeatureCatalog.java b/services/core/java/com/android/server/featuregate/FeatureCatalog.java
+new file mode 100644
+index 000000000000..c68ee38df8f2
+--- /dev/null
++++ b/services/core/java/com/android/server/featuregate/FeatureCatalog.java
+@@ -0,0 +1,95 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.featuregate;
++
++import android.app.featuregate.FeatureGateManager;
++import android.app.featuregate.IFeatureGateManager;
++import android.content.Context;
++import android.content.pm.PackageManager;
++import android.os.Binder;
++import android.os.ServiceSpecificException;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Set;
++
++/*
++ * The set of features FeatureGate knows how to gate, and validation of feature IDs.
++ * Must NOT be called while holding FeatureGateService's lock (it calls PackageManager).
++ */
++final class FeatureCatalog {
++    private static final Set<String> SYSTEM_FEATURES = Set.of(
++            FeatureGateManager.FEATURE_CAMERA,
++            FeatureGateManager.FEATURE_NAV_BACK,
++            FeatureGateManager.FEATURE_NAV_HOME,
++            FeatureGateManager.FEATURE_NAV_RECENTS,
++            FeatureGateManager.FEATURE_NAV_ALL,
++            FeatureGateManager.FEATURE_NOTIFICATION_SHADE,
++            FeatureGateManager.FEATURE_HOTSPOT,
++            FeatureGateManager.FEATURE_WIFI,
++            FeatureGateManager.FEATURE_BLUETOOTH,
++            FeatureGateManager.FEATURE_MOBILE_DATA
++    );
++
++    private final Context mContext;
++
++    FeatureCatalog(Context context) {
++        mContext = context;
++    }
++
++    // Sorted list of system features, plus the app pattern.
++    List<String> getSupportedFeatures() {
++        final List<String> result = new ArrayList<>(SYSTEM_FEATURES);
++        Collections.sort(result);
++        result.add(FeatureGateManager.APP_PREFIX + "<package>");
++        return result;
++    }
++
++    // Throws if the feature ID is not in the catalog.
++    void enforceValid(String featureId) {
++        if(featureId == null || featureId.isEmpty()) {
++            throw new IllegalArgumentException("featureId is empty");
++        }
++
++        if(SYSTEM_FEATURES.contains(featureId)) return;
++
++        if(featureId.startsWith(FeatureGateManager.APP_PREFIX)) {
++            final String pkg = featureId.substring(FeatureGateManager.APP_PREFIX.length());
++            if(!pkg.isEmpty() && packageExists(pkg)) {
++                return;
++            }
++
++            throw new ServiceSpecificException(IFeatureGateManager.ERROR_UNKNOWN_FEATURE, "unknown package: " + pkg);
++        }
++
++        throw new ServiceSpecificException(IFeatureGateManager.ERROR_UNKNOWN_FEATURE, "unknown feature: " + featureId);
++    }
++
++    private boolean packageExists(String pkg) {
++        // Look up as system: the caller's package visibility must not affect validation.
++        final long ident = Binder.clearCallingIdentity();
++        try {
++            mContext.getPackageManager().getPackageInfo(pkg, 0);
++            return true;
++        } catch (PackageManager.NameNotFoundException e) {
++            return false;
++        } finally {
++            Binder.restoreCallingIdentity(ident);
++        }
++    }
++}
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index 4c698f8ef3fc..2dbc81ccac0a 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -3,6 +3,7 @@ package com.android.server.featuregate;
+ import android.app.featuregate.FeatureRule;
+ import android.app.featuregate.IFeatureGateListener;
+ import android.app.featuregate.IFeatureGateManager;
++import android.os.ServiceSpecificException;
+ import android.content.Context;
+ import android.os.Binder;
+ import android.os.Process;
+@@ -59,6 +60,8 @@ public final class FeatureGateService extends SystemService {
+     private final ServiceThread mHandlerThread;
+     private final Handler mHandler;
+ 
++    private final FeatureCatalog mCatalog;
++
+     private final BroadcastReceiver mBatteryReceiver = new BroadcastReceiver() {
+         @Override
+         public void onReceive(Context context, Intent intent) {
+@@ -68,6 +71,7 @@ public final class FeatureGateService extends SystemService {
+ 
+     public FeatureGateService(Context context) {
+         super(context);
++        mCatalog = new FeatureCatalog(context);
+         mHandlerThread = new ServiceThread(TAG, Process.THREAD_PRIORITY_BACKGROUND,
+                 false /* allowIo */);
+         mHandlerThread.start();
+@@ -204,7 +208,7 @@ public final class FeatureGateService extends SystemService {
+     private final class BinderService extends IFeatureGateManager.Stub {
+         @Override
+         public boolean isFeatureAllowed(String featureId) {
+-            if (featureId == null) throw new IllegalArgumentException("featureId is null");
++            mCatalog.enforceValid(featureId);
+ 
+             synchronized (mLock) {
+                 boolean isAllowed = isAllowedLocked(featureId);
+@@ -222,11 +226,14 @@ public final class FeatureGateService extends SystemService {
+ 
+         @Override
+         public void setRule(FeatureRule rule) {
+-            enforceAdminCaller();
++            enforceAdminCaller(); // 1. Permission first
+             if (rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty()
+                     || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) {
+                 throw new IllegalArgumentException("invalid rule: " + rule);
+             }
++
++            mCatalog.enforceValid(rule.getFeatureId()); // 2. Then validate, outside the lock
++
+             final ArrayMap<String, Boolean> changes;
+ 
+             synchronized (mLock) {
+@@ -243,9 +250,7 @@ public final class FeatureGateService extends SystemService {
+         @Override // Binder call: admin only
+         public void removeRule(String featureId) {
+             enforceAdminCaller();
+-            if (featureId == null) {
+-                throw new IllegalArgumentException("featureId is null");
+-            }
++            mCatalog.enforceValid(featureId);
+ 
+             final ArrayMap<String, Boolean> changes;
+ 
+@@ -260,6 +265,11 @@ public final class FeatureGateService extends SystemService {
+             notifyListenerAsync(changes);
+         }
+ 
++        @Override
++        public List<String> getSupportedFeatures() {
++            return mCatalog.getSupportedFeatures();
++        }
++
+         @Override // Binder call
+         public void registerListener(IFeatureGateListener listener) {
+             if (listener == null) {
+@@ -328,10 +338,15 @@ public final class FeatureGateService extends SystemService {
+                         pw.println(id + ": " + (mBinderService.isFeatureAllowed(id) ? "ALLOWED"
+                                 : "BLOCKED"));
+                         return 0;
++                    case "features":
++                        for (String f : mBinderService.getSupportedFeatures()) {
++                            pw.println(f);
++                        }
++                        return 0;
+                     default:
+                         return handleDefaultCommands(cmd);
+                 }
+-            } catch (IllegalArgumentException | SecurityException e){
++            } catch (IllegalArgumentException | SecurityException | ServiceSpecificException e){
+                 getErrPrintWriter().println("Error: " + e.getMessage());
+                 return -1;
+             }
+@@ -344,6 +359,7 @@ public final class FeatureGateService extends SystemService {
+             pw.println("    set-rule <featureId> <minBatteryPercent> <allowWhenCharging>");
+             pw.println("    remove-rule <featureId>");
+             pw.println("    check <featureId>");
++            pw.println("    features");
+         }
+     }
+ }
+\ No newline at end of file
+-- 
+2.53.0
+

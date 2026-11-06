@@ -1,0 +1,238 @@
+From 807f6567d094545431dfeb879c9a5c7832b121e9 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Wed, 28 Oct 2026 07:27:51 +0530
+Subject: [PATCH 05/13] FeatureGate: internal API and enforcer framework
+
+- FeatureGateInternal published via publishLocalService for in-process
+  callers (preventive hooks); mLock is a leaf lock, so it is safe to call
+  with other locks held.
+- FeatureEnforcer interface; one enforcer per feature, checked at boot.
+- Flips are dispatched to enforcers on the service thread, outside the
+  lock, with per-enforcer exception isolation.
+- dumpsys shows the enforcer mapping; cmd internal-check tests the
+  LocalServices path.
+
+Change-Id: Ie268fdb6e083a57dbd38d41d43c6b1ac8b264265
+---
+ .../server/featuregate/FeatureEnforcer.java   | 34 ++++++++++
+ .../featuregate/FeatureGateInternal.java      | 36 +++++++++++
+ .../featuregate/FeatureGateService.java       | 62 ++++++++++++++++++-
+ 3 files changed, 131 insertions(+), 1 deletion(-)
+ create mode 100644 services/core/java/com/android/server/featuregate/FeatureEnforcer.java
+ create mode 100644 services/core/java/com/android/server/featuregate/FeatureGateInternal.java
+
+diff --git a/services/core/java/com/android/server/featuregate/FeatureEnforcer.java b/services/core/java/com/android/server/featuregate/FeatureEnforcer.java
+new file mode 100644
+index 000000000000..89c586163453
+--- /dev/null
++++ b/services/core/java/com/android/server/featuregate/FeatureEnforcer.java
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.featuregate;
++
++import java.util.Set;
++
++/*
++* Applies or removes the real block for some features.
++* Called on FeatureGate's service thread, never while FeatureGate's lock is held.
++*/
++interface FeatureEnforcer {
++    // Short names for log and dumpsys.
++    String getName();
++
++    // The catalog featureIds this enforcer is responsible for.
++    Set<String> getHandledFeatures();
++
++    // A handle feature became allowed (remove the block) or blocked (apply it).
++    void onFeatureStateChanged(String featureId, boolean allowed);
++}
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateInternal.java b/services/core/java/com/android/server/featuregate/FeatureGateInternal.java
+new file mode 100644
+index 000000000000..e885eb368f95
+--- /dev/null
++++ b/services/core/java/com/android/server/featuregate/FeatureGateInternal.java
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.featuregate;
++
++/**
++ * In-process API for other system_server components (e.g the camera hook)
++ * Get it with LocalServices.getService(FeatureGateInternal.class).
++ * Not visible to apps: it is never registered in ServiceManager.
++ */
++public abstract class FeatureGateInternal {
++    /*
++    * Returns true if the feature is allowed right now. Features with no rules are allowed.
++    * Fast, never does I/O or calls out, so it is safe to call while holding other locks
++    */
++    public abstract boolean isFeatureAllowed(String featureId);
++
++    /*
++    * Called by a preventive hook after it refused a feature, so FeatureGate can tell the
++    * user why.
++    */
++    public abstract void notifyBlocked(String featureId);
++}
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index 2dbc81ccac0a..48492eb849aa 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -31,6 +31,8 @@ import com.android.internal.util.DumpUtils;
+ import com.android.server.ServiceThread;
+ import java.io.FileDescriptor;
+ import java.io.PrintWriter;
++
++import com.android.server.LocalServices;
+ public final class FeatureGateService extends SystemService {
+     private static final String TAG = "FeatureGateService";
+ 
+@@ -62,6 +64,9 @@ public final class FeatureGateService extends SystemService {
+ 
+     private final FeatureCatalog mCatalog;
+ 
++    // featureId -> the enforcer responsible for it. Only modified in the constructor.
++    private final ArrayMap<String, FeatureEnforcer> mEnforcers = new ArrayMap<>();
++
+     private final BroadcastReceiver mBatteryReceiver = new BroadcastReceiver() {
+         @Override
+         public void onReceive(Context context, Intent intent) {
+@@ -80,7 +85,8 @@ public final class FeatureGateService extends SystemService {
+ 
+     @Override
+     public void onStart() {
+-        publishBinderService(Context.FEATURE_GATE_SERVICE, mBinderService);
++        publishBinderService(Context.FEATURE_GATE_SERVICE, mBinderService); //For apps
++        publishLocalService(FeatureGateInternal.class, new LocalService()); //For system_server
+         Slog.i(TAG, "FeatureGateService started");
+     }
+ 
+@@ -173,6 +179,7 @@ public final class FeatureGateService extends SystemService {
+ 
+     /** Runs only on mHandler, so braodcasts never overlap and stay in order. */
+     private void notifyListeners(ArrayMap<String, Boolean> changes) {
++        dispatchToEnforcers(changes);
+         for (int j = 0; j < changes.size(); j++) {
+             Slog.i(TAG, "notifyListeners: " + changes.keyAt(j) + " -> " + (changes.valueAt(j)
+                     ? "Allowed" : "Blocked"));
+@@ -196,6 +203,25 @@ public final class FeatureGateService extends SystemService {
+         }
+     }
+ 
++    // Runs on mHandler, without mLock
++    private void dispatchToEnforcers(ArrayMap<String, Boolean> changes) {
++        for (int j = 0; j < changes.size(); j++) {
++            final String featureId = changes.keyAt(j);
++            final boolean allowed = changes.valueAt(j);
++            final FeatureEnforcer enforcer = mEnforcers.get(featureId);
++            if (enforcer == null) {
++                Slog.i(TAG, "No enforcer yet for " + featureId + " (" + (allowed ? "ALLOWED" : "BLOCKED") +")");
++                continue;
++            }
++            try {
++                enforcer.onFeatureStateChanged(featureId, allowed);
++            } catch (RuntimeException e) {
++                // One broken enforcer must not crash system_server or stop the others.
++                Slog.e(TAG, "enforcer " + enforcer.getName() + " failed for " + featureId, e);
++            }
++        }
++    }
++
+     /** Temporary admin checks until MANAGE_FEATURE_GATES permssion exists */
+     private static void enforceAdminCaller() {
+         final int uid = Binder.getCallingUid();
+@@ -204,6 +230,30 @@ public final class FeatureGateService extends SystemService {
+         }
+     }
+ 
++    // Call only from the constructor, before any battery or rule work is done.
++    private void registerEnforcer(FeatureEnforcer enforcer) {
++        for (String featureId : enforcer.getHandledFeatures()) {
++            final FeatureEnforcer old = mEnforcers.put(featureId, enforcer);
++            if (old != null) {
++                throw new IllegalStateException(featureId + " handled by both " + old.getName() + " and " + enforcer.getName());
++            }
++        }
++    }
++
++    private final class LocalService extends FeatureGateInternal {
++        @Override
++        public boolean isFeatureAllowed(String featureId) {
++            if (featureId == null) return true;
++            synchronized (mLock) { // Leaflock. No outgoing calls inside
++                return isAllowedLocked(featureId);
++            }
++        }
++
++        @Override
++        public void notifyBlocked(String featureId) {
++            Slog.i(TAG, "blocked by FeatureGate: " + featureId);
++        }
++    }
+ 
+     private final class BinderService extends IFeatureGateManager.Stub {
+         @Override
+@@ -301,6 +351,10 @@ public final class FeatureGateService extends SystemService {
+                             : "BLOCKED"));
+                 }
+             }
++            pw.println("  enforcers: " + (mEnforcers.isEmpty() ? "none yet" : ""));
++            for (int i = 0; i < mEnforcers.size(); i++) {
++                pw.println("    " + mEnforcers.keyAt(i) + " -> " + mEnforcers.valueAt(i).getName());
++            }
+             pw.println(" listeners: "+ mListeners.getRegisteredCallbackCount());
+         }
+ 
+@@ -343,6 +397,11 @@ public final class FeatureGateService extends SystemService {
+                             pw.println(f);
+                         }
+                         return 0;
++                    case "internal-check":
++                        final String Id = getNextArgRequired();
++                        final FeatureGateInternal internal = LocalServices.getService(FeatureGateInternal.class);
++                        pw.println(Id + " (via LocalServices):" + (internal.isFeatureAllowed(Id) ? "ALLOWED" : "BLOCKED"));
++                        return 0;
+                     default:
+                         return handleDefaultCommands(cmd);
+                 }
+@@ -360,6 +419,7 @@ public final class FeatureGateService extends SystemService {
+             pw.println("    remove-rule <featureId>");
+             pw.println("    check <featureId>");
+             pw.println("    features");
++            pw.println("    internal-check <featureId>");
+         }
+     }
+ }
+\ No newline at end of file
+-- 
+2.53.0
+

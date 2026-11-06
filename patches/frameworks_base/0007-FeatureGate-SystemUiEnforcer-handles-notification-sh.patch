@@ -1,0 +1,157 @@
+From 6b8ffe62480ad650ad3fd2d60519741c6fda4a1c Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Thu, 29 Oct 2026 07:29:23 +0530
+Subject: [PATCH 07/13] FeatureGate: SystemUiEnforcer handles notification
+ shade
+
+- notification_shade -> DISABLE_EXPAND plus DISABLE2_NOTIFICATION_SHADE
+  and DISABLE2_QUICK_SETTINGS via disable2().
+- Both flag sets sent with FeatureGate's token; sending 0/0 removes the
+  record (explicit cleanup, since a local token gets no death callbacks).
+- FeatureEnforcer gets a default dump(); dumpsys prints each enforcer once.
+
+Change-Id: I3d4467d9eb18c49e0d01b001aab9d14449bb5613
+---
+ .../server/featuregate/FeatureEnforcer.java   |  4 ++
+ .../featuregate/FeatureGateService.java       |  5 ++
+ .../server/featuregate/SystemUiEnforcer.java  | 47 +++++++++++++++----
+ 3 files changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/services/core/java/com/android/server/featuregate/FeatureEnforcer.java b/services/core/java/com/android/server/featuregate/FeatureEnforcer.java
+index 89c586163453..590a23b0e10d 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureEnforcer.java
++++ b/services/core/java/com/android/server/featuregate/FeatureEnforcer.java
+@@ -17,6 +17,7 @@
+ package com.android.server.featuregate;
+ 
+ import java.util.Set;
++import java.io.PrintWriter;
+ 
+ /*
+ * Applies or removes the real block for some features.
+@@ -31,4 +32,7 @@ interface FeatureEnforcer {
+ 
+     // A handle feature became allowed (remove the block) or blocked (apply it).
+     void onFeatureStateChanged(String featureId, boolean allowed);
++
++    // Print enforcer state for dumpsys. Default - does nothing
++    default void dump(PrintWriter pw) {}
+ }
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index 2102cfc15530..39db29585cd8 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -356,6 +356,11 @@ public final class FeatureGateService extends SystemService {
+             for (int i = 0; i < mEnforcers.size(); i++) {
+                 pw.println("    " + mEnforcers.keyAt(i) + " -> " + mEnforcers.valueAt(i).getName());
+             }
++            pw.println("  enforcer state:");
++            final ArraySet<FeatureEnforcer> unique = new ArraySet<>(mEnforcers.values());
++            for(int i = 0; i < unique.size(); i++) {
++                unique.valueAt(i).dump(pw);
++            }
+             pw.println(" listeners: "+ mListeners.getRegisteredCallbackCount());
+         }
+ 
+diff --git a/services/core/java/com/android/server/featuregate/SystemUiEnforcer.java b/services/core/java/com/android/server/featuregate/SystemUiEnforcer.java
+index b37ca48d9dae..d678536a8979 100644
+--- a/services/core/java/com/android/server/featuregate/SystemUiEnforcer.java
++++ b/services/core/java/com/android/server/featuregate/SystemUiEnforcer.java
+@@ -29,18 +29,23 @@ import android.util.Slog;
+ import com.android.internal.statusbar.IStatusBarService;
+ 
+ import java.util.Set;
++import java.io.PrintWriter;
+ 
+ final class SystemUiEnforcer implements FeatureEnforcer{
+     private static final String TAG = "FeatureGate.SystemUI";
+     private final Context mContext;
+ 
+-    //Identifies FeatureGate's disable request inside StatusBarManagerService.
++    // Identifies FeatureGate's disable request inside StatusBarManagerService.
+     private final IBinder mToken = new Binder();
+ 
+-    //Nav features currently blocked. Only touched on the service thread.
++    // Nav features currently blocked. Only touched on the service thread.
+     private final ArraySet<String> mBlocked = new ArraySet<>();
+     private IStatusBarService mStatusBar; // looked up lazily
+ 
++    // Fields to remember what we sent last
++    private int mLastFlag1 = StatusBarManager.DISABLE_NONE;
++    private int mLastFlag2 = StatusBarManager.DISABLE2_NONE;
++
+     SystemUiEnforcer(Context context) {
+         mContext = context;
+     }
+@@ -56,7 +61,8 @@ final class SystemUiEnforcer implements FeatureEnforcer{
+                 FeatureGateManager.FEATURE_NAV_BACK,
+                 FeatureGateManager.FEATURE_NAV_HOME,
+                 FeatureGateManager.FEATURE_NAV_RECENTS,
+-                FeatureGateManager.FEATURE_NAV_ALL
++                FeatureGateManager.FEATURE_NAV_ALL,
++                FeatureGateManager.FEATURE_NOTIFICATION_SHADE
+         );
+     }
+ 
+@@ -73,15 +79,24 @@ final class SystemUiEnforcer implements FeatureEnforcer{
+     //Recomputes the full flag mask from mBlocked and sends it with our token.
+     private void applyFlags() {
+         final boolean all = mBlocked.contains(FeatureGateManager.FEATURE_NAV_ALL);
+-        int flags = StatusBarManager.DISABLE_NONE;
++        final boolean shade = mBlocked.contains(FeatureGateManager.FEATURE_NOTIFICATION_SHADE);
++        int flags1 = StatusBarManager.DISABLE_NONE;
+         if(all || mBlocked.contains(FeatureGateManager.FEATURE_NAV_BACK)) {
+-            flags |= StatusBarManager.DISABLE_BACK;
++            flags1 |= StatusBarManager.DISABLE_BACK;
+         }
+         if(all || mBlocked.contains(FeatureGateManager.FEATURE_NAV_HOME)) {
+-            flags |= StatusBarManager.DISABLE_HOME;
++            flags1 |= StatusBarManager.DISABLE_HOME;
+         }
+         if(all || mBlocked.contains(FeatureGateManager.FEATURE_NAV_RECENTS)) {
+-            flags |= StatusBarManager.DISABLE_RECENT;
++            flags1 |= StatusBarManager.DISABLE_RECENT;
++        }
++        if(shade) {
++            flags1 |= StatusBarManager.DISABLE_EXPAND;
++        }
++
++        int flags2 = StatusBarManager.DISABLE2_NONE;
++        if(shade) {
++            flags2 |= StatusBarManager.DISABLE2_NOTIFICATION_SHADE | StatusBarManager.DISABLE2_QUICK_SETTINGS;
+         }
+ 
+         final IStatusBarService statusBar = getStatusBar();
+@@ -90,8 +105,14 @@ final class SystemUiEnforcer implements FeatureEnforcer{
+             return;
+         }
+         try{
+-            statusBar.disable(flags, mToken, mContext.getOpPackageName());
+-            Slog.i(TAG, " disable flags now 0x" + Integer.toHexString(flags) + " blocked = " + mBlocked);
++            // Sending 0 for both removes FeatureGate's record from SBMS
++            // (explicit cleanup : Our token is a local Binder, so SBMS cannot rely on linkToDeath() for it.
++            statusBar.disable(flags1, mToken, mContext.getOpPackageName());
++            statusBar.disable2(flags2, mToken, mContext.getOpPackageName());
++            mLastFlag1 = flags1;
++            mLastFlag2 = flags2;
++            Slog.i(TAG, "disable flags now 0x" + Integer.toHexString(flags1)
++                    + " / 0x" + Integer.toHexString(flags2) + " blocked=" + mBlocked);
+         } catch (RemoteException e) {
+             Slog.e(TAG, "Failed to update status bar " + e);
+         }
+@@ -103,4 +124,12 @@ final class SystemUiEnforcer implements FeatureEnforcer{
+         }
+         return mStatusBar;
+     }
++
++    // Dump method to print to dumpsys
++    @Override
++    public void dump(PrintWriter pw) {
++        pw.println("    " + getName() + ": blocked=" + mBlocked
++                   + " flags1=0x" + Integer.toHexString(mLastFlag1)
++                   + " flags2=0x" + Integer.toHexString(mLastFlag2));
++    }
+ }
+-- 
+2.53.0
+

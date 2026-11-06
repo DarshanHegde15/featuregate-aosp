@@ -1,0 +1,9 @@
+# Never commit build output or device images
+out/
+*.img
+*.apk
+*.zip
+# IDE files
+.idea/
+*.iml
+.asfp-project

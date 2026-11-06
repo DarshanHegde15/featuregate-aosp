@@ -1,0 +1,8 @@
+android_app {
+    name: "FeatureGateConsole",
+    srcs: ["src/**/*.kt"],
+    resource_dirs: ["res"],
+    manifest: "AndroidManifest.xml",
+    platform_apis: true,
+    certificate: "platform",
+}

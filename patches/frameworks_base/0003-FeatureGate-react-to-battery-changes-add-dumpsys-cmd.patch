@@ -1,0 +1,456 @@
+From 069481cf6167499f779b30ccebc6ac981b611940 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Tue, 20 Oct 2026 13:00:36 +0530
+Subject: [PATCH 03/13] FeatureGate: react to battery changes, add dumpsys, cmd
+ and listener API
+
+- Registers for sticky ACTION_BATTERY_CHANGED at PHASE_SYSTEM_SERVICES_READY
+  on a dedicated ServiceThread; re-evaluates rules only when percent or
+  plug state changes.
+- Notifies listeners of features whose allowed state flipped, outside the
+  lock, serialized on the service thread.
+- Adds dump() for 'dumpsys feature_gate' and a ShellCommand for
+  'cmd feature_gate set-rule/remove-rule/check'.
+- FeatureGateManager: Listener + Executor registration via a hidden
+  ListenerTransport stub.
+
+Change-Id: I0b9b5b68134d2ca6737071a71afb96ab9d00c2c0
+---
+ .../app/featuregate/FeatureGateManager.java   |  80 +++++-
+ .../featuregate/FeatureGateService.java       | 251 +++++++++++++++++-
+ 2 files changed, 320 insertions(+), 11 deletions(-)
+
+diff --git a/core/java/android/app/featuregate/FeatureGateManager.java b/core/java/android/app/featuregate/FeatureGateManager.java
+index 36d6dbb4e564..23184acf1de1 100644
+--- a/core/java/android/app/featuregate/FeatureGateManager.java
++++ b/core/java/android/app/featuregate/FeatureGateManager.java
+@@ -19,19 +19,33 @@ package android.app.featuregate;
+ import android.annotation.NonNull;
+ import android.content.Context;
+ import android.app.featuregate.IFeatureGateManager;
++import android.app.featuregate.IFeatureGateListener;
+ import android.os.RemoteException;
+ 
+ import java.util.List;
+ import java.util.Objects;
+ 
++import android.annotation.CallbackExecutor;
++import android.os.Binder;
++import android.util.ArrayMap;
++import com.android.internal.annotations.GuardedBy;
++
++import java.util.concurrent.Executor;
++
+ /**
+  * Client API for FeatureGateService.
+  * Get it with {@code context.getSystemService(FeatureGateManager.class)}.
+  * @hide
+  */
+ public class FeatureGateManager {
+-        private final Context mContext;
+-        private final IFeatureGateManager mService;
++    private final Context mContext;
++    private final IFeatureGateManager mService;
++
++    private final Object mLock = new Object();
++    ;
++    @GuardedBy("mLock")
++    private final ArrayMap<Listener, ListenerTransport> mTransports = new ArrayMap<>();
++
+ 
+     /** @hide */
+     public FeatureGateManager(@NonNull Context context, @NonNull IFeatureGateManager service) {
+@@ -79,4 +93,66 @@ public class FeatureGateManager {
+         }
+     }
+ 
++    /** Receives feature state changes. Plain Java interface: apps never see AIDL. */
++    public interface Listener {
++        void onFeatureGateChanged(@NonNull String featureId, boolean allowed);
++    }
++
++    /** Registers a listener; callbacks are delivered on the ginen executor. */
++    public void registerListener(@NonNull @CallbackExecutor Executor executor,
++            @NonNull Listener listener) {
++        Objects.requireNonNull(executor, "executor");
++        Objects.requireNonNull(listener, "listener");
++        final ListenerTransport transport;
++
++        synchronized (mLock) {
++            if (mTransports.containsKey(listener)) {
++                return; //already registered;
++            }
++            transport = new ListenerTransport(executor, listener);
++            mTransports.put(listener, transport);
++        }
++        try {
++            mService.registerListener(transport);
++        } catch (RemoteException e) {
++            throw e.rethrowFromSystemServer();
++        }
++    }
++
++    /** Unregisters a listener. */
++    public void unregisterListener(@NonNull Listener listener) {
++        Objects.requireNonNull(listener, "listener");
++        final ListenerTransport transport;
++        synchronized (mLock) {
++            transport = mTransports.remove(listener);
++        }
++        if (transport == null) return;
++        try {
++            mService.unregisterListener(transport);
++        } catch (RemoteException e) {
++            throw e.rethrowFromSystemServer();
++        }
++    }
++
++    /** The AIDL stub system_server actually calls. Hidden inside the Manager. */
++    private static final class ListenerTransport extends IFeatureGateListener.Stub {
++        private final Executor mExecutor;
++        private final Listener mListener;
++
++        ListenerTransport(Executor executor, Listener listener) {
++            mExecutor = executor;
++            mListener = listener;
++        }
++
++        @Override
++        public void onFeatureStateChanged(@NonNull String featureId, boolean allowed) {
++            // Arrives on an app binder thread. Hand it to the app's chosen executor.
++            final long ident = Binder.clearCallingIdentity();
++            try {
++                mExecutor.execute(() -> mListener.onFeatureGateChanged(featureId, allowed));
++            } finally {
++                Binder.restoreCallingIdentity(ident);
++            }
++        }
++    }
+ }
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index 8e91572ee11a..4c698f8ef3fc 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -15,6 +15,21 @@ import com.android.server.SystemService;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
++
++import android.content.BroadcastReceiver;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.os.BatteryManager;
++import android.os.Handler;
++import android.os.RemoteException;
++import android.os.ResultReceiver;
++import android.os.ShellCallback;
++import android.os.ShellCommand;
++import android.util.ArraySet;
++import com.android.internal.util.DumpUtils;
++import com.android.server.ServiceThread;
++import java.io.FileDescriptor;
++import java.io.PrintWriter;
+ public final class FeatureGateService extends SystemService {
+     private static final String TAG = "FeatureGateService";
+ 
+@@ -28,13 +43,35 @@ public final class FeatureGateService extends SystemService {
+     @GuardedBy("mLock")
+     private int mBatteryPercent = 100;
+     @GuardedBy("mLock")
+-    boolean mCharging = false;
++    private boolean mCharging = false;
++    @GuardedBy("mLock")
++    private boolean mBatteryKnown = false;
+ 
+-    private final BinderService mBinderService = new BinderService();    /** App listeners. Dead clients are removed automatically */
++    private final BinderService mBinderService = new BinderService();
++    /** App listeners. Dead clients are removed automatically */
+     private final RemoteCallbackList<IFeatureGateListener> mListeners = new RemoteCallbackList<>();
+ 
++    /** App listeners. Dead clients are removed automatically. */
++    private final RemoteCallbackList<IFeatureGateListener> mShellCallbacks =
++            new RemoteCallbackList<>();
++
++    /** Our own thread: battery handling and listener notifications run here. */
++    private final ServiceThread mHandlerThread;
++    private final Handler mHandler;
++
++    private final BroadcastReceiver mBatteryReceiver = new BroadcastReceiver() {
++        @Override
++        public void onReceive(Context context, Intent intent) {
++            onBatteryIntent(intent);
++        }
++    };
++
+     public FeatureGateService(Context context) {
+         super(context);
++        mHandlerThread = new ServiceThread(TAG, Process.THREAD_PRIORITY_BACKGROUND,
++                false /* allowIo */);
++        mHandlerThread.start();
++        mHandler = new Handler(mHandlerThread.getLooper());
+     }
+ 
+     @Override
+@@ -43,6 +80,54 @@ public final class FeatureGateService extends SystemService {
+         Slog.i(TAG, "FeatureGateService started");
+     }
+ 
++    @Override
++    public void onBootPhase(int phase) {
++        if (phase == PHASE_SYSTEM_SERVICES_READY) {
++            registerBatteryReceiver();
++        }
++    }
++
++    private void registerBatteryReceiver() {
++        final IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
++        // Sticky boradcast: returns the latest battery intent immediately.
++        final Intent sticky = getContext().registerReceiver(mBatteryReceiver, filter,
++                null /* broadcastPermission */, mHandler, Context.RECEIVER_NOT_EXPORTED);
++        if (sticky != null) {
++            mHandler.post(() -> onBatteryIntent(sticky));
++        }
++        Slog.i(TAG, "registerBatteryReceiver: Battery Receiver registered");
++    }
++
++    /** Runs on mHandler */
++    private void onBatteryIntent(Intent intent) {
++        final int level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
++        final int scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
++        final int plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
++
++        if (level < 0 || scale <= 0) {
++            return;
++        }
++
++        final int percent = level * 100 / scale;
++        final boolean charging = plugged != 0;
++        final ArrayMap<String, Boolean> changes;
++
++        synchronized (mLock) {
++            if (mBatteryKnown && percent == mBatteryPercent && charging == mCharging) {
++                return; // nothing we use changed (temperature/voltag-only update
++            }
++
++            final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
++            final ArrayMap<String, Boolean> before = snapshotLocked(ids);
++            mBatteryPercent = percent;
++            mCharging = charging;
++            mBatteryKnown = true;
++            changes = diffLocked(ids, before);
++        }
++        Slog.i(TAG, "onBatteryIntent: battery " + percent + "% charging " + charging);
++        notifyListenerAsync(changes);
++    }
++
+     @GuardedBy("mLock")
+     private boolean isAllowedLocked(String featureId) {
+         final FeatureRule rule = mRules.get(featureId);
+@@ -51,23 +136,79 @@ public final class FeatureGateService extends SystemService {
+             return true;
+         }
+         Slog.i(TAG, "isAllowedLocked: Feature rule found, checking ....");
+-        return mBatteryPercent >= rule.getMinBatteryPercent() || (rule.getAllowWhenCharging() && mCharging);
++        return mBatteryPercent >= rule.getMinBatteryPercent() || (rule.getAllowWhenCharging()
++                && mCharging);
++    }
++
++    @GuardedBy("mLock")
++    private ArrayMap<String, Boolean> snapshotLocked(ArraySet<String> ids) {
++        final ArrayMap<String, Boolean> result = new ArrayMap<>();
++        for (int i = 0; i < ids.size(); i++) {
++            final String id = ids.valueAt(i);
++            result.put(id, isAllowedLocked(id));
++        }
++        return result;
++    }
++
++    @GuardedBy("mLock")
++    private ArrayMap<String, Boolean> diffLocked(ArraySet<String> ids,
++            ArrayMap<String, Boolean> before) {
++        final ArrayMap<String, Boolean> changes = new ArrayMap<>();
++        for (int i = 0; i < ids.size(); i++) {
++            final String id = ids.valueAt(i);
++            final boolean now = isAllowedLocked(id);
++            if (now != before.get(id)) changes.put(id, now);
++        }
++        return changes;
++    }
++
++    private void notifyListenerAsync(ArrayMap<String, Boolean> changes) {
++        if (changes.isEmpty()) return;
++        mHandler.post(() -> notifyListeners(changes));
++    }
++
++    /** Runs only on mHandler, so braodcasts never overlap and stay in order. */
++    private void notifyListeners(ArrayMap<String, Boolean> changes) {
++        for (int j = 0; j < changes.size(); j++) {
++            Slog.i(TAG, "notifyListeners: " + changes.keyAt(j) + " -> " + (changes.valueAt(j)
++                    ? "Allowed" : "Blocked"));
++        }
++
++        final int n = mListeners.beginBroadcast();
++
++        try {
++            for (int i = 0; i < n; i++) {
++                final IFeatureGateListener listener = mListeners.getBroadcastItem(i);
++                for (int j = 0; j < changes.size(); j++) {
++                    try {
++                        listener.onFeatureStateChanged(changes.keyAt(j), changes.valueAt(j));
++                    } catch (RemoteException e) {
++                        // client died : RemoteCallbackList removes it
++                    }
++                }
++            }
++        } finally {
++            mListeners.finishBroadcast();
++        }
+     }
+ 
+     /** Temporary admin checks until MANAGE_FEATURE_GATES permssion exists */
+     private static void enforceAdminCaller() {
+         final int uid = Binder.getCallingUid();
+-        if(uid != Process.SYSTEM_UID && uid != Process.SHELL_UID && uid != Process.ROOT_UID) { throw new SecurityException("Uid" + uid + "man not change feature rules"); }
++        if (uid != Process.SYSTEM_UID && uid != Process.SHELL_UID && uid != Process.ROOT_UID) {
++            throw new SecurityException("Uid" + uid + "man not change feature rules");
++        }
+     }
+ 
++
+     private final class BinderService extends IFeatureGateManager.Stub {
+         @Override
+         public boolean isFeatureAllowed(String featureId) {
+-            if(featureId == null) throw new IllegalArgumentException("featureId is null");
++            if (featureId == null) throw new IllegalArgumentException("featureId is null");
+ 
+-            synchronized(mLock) {
++            synchronized (mLock) {
+                 boolean isAllowed = isAllowedLocked(featureId);
+-                Slog.i(TAG,"isFeatureAllowed: " + isAllowed);
++                Slog.i(TAG, "isFeatureAllowed: " + isAllowed);
+                 return isAllowed;
+             }
+         }
+@@ -82,7 +223,21 @@ public final class FeatureGateService extends SystemService {
+         @Override
+         public void setRule(FeatureRule rule) {
+             enforceAdminCaller();
+-            if(rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty() || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) { throw new IllegalArgumentException("invalid rule: " + rule); }
++            if (rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty()
++                    || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) {
++                throw new IllegalArgumentException("invalid rule: " + rule);
++            }
++            final ArrayMap<String, Boolean> changes;
++
++            synchronized (mLock) {
++                final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
++                ids.add(rule.getFeatureId());
++                final ArrayMap<String, Boolean> before = snapshotLocked(ids);
++                mRules.put(rule.getFeatureId(), rule);
++                changes = diffLocked(ids, before);
++            }
++            Slog.i(TAG, "setRule " + rule + " by uid " + Binder.getCallingUid());
++            notifyListenerAsync(changes);
+         }
+ 
+         @Override // Binder call: admin only
+@@ -91,10 +246,18 @@ public final class FeatureGateService extends SystemService {
+             if (featureId == null) {
+                 throw new IllegalArgumentException("featureId is null");
+             }
++
++            final ArrayMap<String, Boolean> changes;
++
+             synchronized (mLock) {
++                final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
++                ids.add(featureId);
++                final ArrayMap<String, Boolean> before = snapshotLocked(ids);
+                 mRules.remove(featureId);
++                changes = diffLocked(ids, before);
+             }
+             Slog.i(TAG, "removeRule " + featureId + " by uid " + Binder.getCallingUid());
++            notifyListenerAsync(changes);
+         }
+ 
+         @Override // Binder call
+@@ -112,5 +275,75 @@ public final class FeatureGateService extends SystemService {
+             }
+             mListeners.unregister(listener);
+         }
++
++        @Override
++        public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
++            if (!DumpUtils.checkDumpPermission(getContext(), TAG, pw)) return;
++
++            synchronized (mLock) {
++                pw.println("FeatureGate state: ");
++                pw.println(" battery: " + (mBatteryKnown ? mBatteryPercent + "%" : "unknown")
++                        + ", charging: " + mCharging);
++                pw.println(" rules (" + mRules.size() + "):");
++                for (int i = 0; i < mRules.size(); i++) {
++                    final FeatureRule r = mRules.valueAt(i);
++                    pw.println("    " + r + " -> " + (isAllowedLocked(r.getFeatureId()) ? "ALLOWED"
++                            : "BLOCKED"));
++                }
++            }
++            pw.println(" listeners: "+ mListeners.getRegisteredCallbackCount());
++        }
++
++        @Override
++        public void onShellCommand(FileDescriptor in, FileDescriptor out, FileDescriptor err,
++                String[] args, ShellCallback callback, ResultReceiver resultReceiver) {
++            new FeatureGateShellCommand().exec(this, in, out, err, args, callback, resultReceiver);
++        }
++    }
++
++    private final class FeatureGateShellCommand extends ShellCommand {
++        @Override
++        public int onCommand(String cmd) {
++            if (cmd == null) {
++                return handleDefaultCommands(cmd);
++            }
++
++            final PrintWriter pw = getOutPrintWriter();
++            try {
++                switch (cmd) {
++                    case "set-rule": {
++                        final String id = getNextArgRequired();
++                        final int min = Integer.parseInt(getNextArgRequired());
++                        final boolean whenCharging = Boolean.getBoolean(getNextArgRequired());
++                        mBinderService.setRule(new FeatureRule(id, min, whenCharging));
++                        pw.println("OK");
++                        return 0;
++                    }
++                    case "remove-rule":
++                        mBinderService.removeRule(getNextArgRequired());
++                        pw.println("OK");
++                        return 0;
++                    case "check":
++                        final String id = getNextArgRequired();
++                        pw.println(id + ": " + (mBinderService.isFeatureAllowed(id) ? "ALLOWED"
++                                : "BLOCKED"));
++                        return 0;
++                    default:
++                        return handleDefaultCommands(cmd);
++                }
++            } catch (IllegalArgumentException | SecurityException e){
++                getErrPrintWriter().println("Error: " + e.getMessage());
++                return -1;
++            }
++        }
++
++        @Override
++        public void onHelp() {
++            final PrintWriter pw = getOutPrintWriter();
++            pw.println("FeatureGate commands: ");
++            pw.println("    set-rule <featureId> <minBatteryPercent> <allowWhenCharging>");
++            pw.println("    remove-rule <featureId>");
++            pw.println("    check <featureId>");
++        }
+     }
+-}
++}
+\ No newline at end of file
+-- 
+2.53.0
+

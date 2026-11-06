@@ -1,0 +1,54 @@
+From 7e7ae3e80efeb45196a1bb7a5aa0e36d2226edd8 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Sat, 17 Oct 2026 18:03:18 +0530
+Subject: [PATCH] FeatureGate: label feature_gate service
+
+Adds feature_gate_service (private type) so system_server can add
+and apps can find the feature_gate service.
+
+Change-Id: I80b6446ace4215852b22daac6f3214627323162f
+---
+ build/soong/service_fuzzer_bindings.go | 1 +
+ private/service.te                     | 1 +
+ private/service_contexts               | 1 +
+ 3 files changed, 3 insertions(+)
+
+diff --git a/build/soong/service_fuzzer_bindings.go b/build/soong/service_fuzzer_bindings.go
+index 39f414c10..38dcac7be 100644
+--- a/build/soong/service_fuzzer_bindings.go
++++ b/build/soong/service_fuzzer_bindings.go
+@@ -290,6 +290,7 @@ var (
+ 		"file_integrity":                EXCEPTION_NO_FUZZER,
+ 		"fingerprint":                   EXCEPTION_NO_FUZZER,
+ 		"feature_flags":                 EXCEPTION_NO_FUZZER,
++                "feature_gate":                  EXCEPTION_NO_FUZZER,
+ 		"font":                          EXCEPTION_NO_FUZZER,
+ 		"forensic":                      EXCEPTION_NO_FUZZER,
+ 		"android.hardware.fingerprint.IFingerprintDaemon": EXCEPTION_NO_FUZZER,
+diff --git a/private/service.te b/private/service.te
+index 7e893009c..a6ccc04ba 100644
+--- a/private/service.te
++++ b/private/service.te
+@@ -11,6 +11,7 @@ type compos_service,                 service_manager_type;
+ type communal_service,               app_api_service, system_server_service, service_manager_type;
+ type dynamic_system_service,         system_api_service, system_server_service, service_manager_type;
+ type feature_flags_service,          app_api_service, system_server_service, service_manager_type;
++type feature_gate_service,           app_api_service, system_server_service, service_manager_type;
+ type fwk_devicestate_service, system_server_service, service_manager_type;
+ type gsi_service,                    service_manager_type;
+ type incidentcompanion_service,      app_api_service, system_api_service, system_server_service, service_manager_type;
+diff --git a/private/service_contexts b/private/service_contexts
+index 1478e93ad..7b567e95d 100644
+--- a/private/service_contexts
++++ b/private/service_contexts
+@@ -277,6 +277,7 @@ external_vibrator_service                 u:object_r:external_vibrator_service:s
+ ethernet                                  u:object_r:ethernet_service:s0
+ face                                      u:object_r:face_service:s0
+ feature_flags                             u:object_r:feature_flags_service:s0
++feature_gate                              u:object_r:feature_gate_service:s0
+ file_integrity                            u:object_r:file_integrity_service:s0
+ fingerprint                               u:object_r:fingerprint_service:s0
+ font                                      u:object_r:font_service:s0
+-- 
+2.53.0
+

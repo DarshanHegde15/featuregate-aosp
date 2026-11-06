@@ -1,0 +1,288 @@
+From 84a48e1978a8481c4a9c434e2e2de9be3995035f Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Sat, 17 Oct 2026 17:59:28 +0530
+Subject: [PATCH 02/13] FeatureGate: add FeatureGateService and
+ FeatureGateManager
+
+FeatureGateService runs in system_server, published as 'feature_gate'.
+Rules kept in memory; queries open to all; setRule/removeRule limited
+to system/shell/root UIDs until a real permission is added.
+FeatureGateManager registered in SystemServiceRegistry.
+
+Change-Id: I0ec2ef2914d7c554ef4aa60e5321cae1e7a151b5
+---
+ .../android/app/SystemServiceRegistry.java    |  13 ++
+ .../app/featuregate/FeatureGateManager.java   |  82 +++++++++++++
+ .../featuregate/FeatureGateService.java       | 116 ++++++++++++++++++
+ .../java/com/android/server/SystemServer.java |   5 +
+ 4 files changed, 216 insertions(+)
+ create mode 100644 core/java/android/app/featuregate/FeatureGateManager.java
+ create mode 100644 services/core/java/com/android/server/featuregate/FeatureGateService.java
+
+diff --git a/core/java/android/app/SystemServiceRegistry.java b/core/java/android/app/SystemServiceRegistry.java
+index 920b19cd8f78..c6d4dc4dea6b 100644
+--- a/core/java/android/app/SystemServiceRegistry.java
++++ b/core/java/android/app/SystemServiceRegistry.java
+@@ -293,6 +293,8 @@ import java.time.InstantSource;
+ import java.util.Map;
+ import java.util.Objects;
+ 
++import android.app.featuregate.FeatureGateManager;
++import android.app.featuregate.IFeatureGateManager;
+ /**
+  * Manages all of the system services that can be returned by {@link Context#getSystemService}.
+  * Used by {@link ContextImpl}.
+@@ -804,6 +806,17 @@ public final class SystemServiceRegistry {
+                         return new SystemVibratorManager(ctx);
+                     }});
+ 
++        registerService(Context.FEATURE_GATE_SERVICE, FeatureGateManager.class,
++                new CachedServiceFetcher<FeatureGateManager>() {
++                    @Override
++                    public FeatureGateManager createService(ContextImpl ctx)
++                            throws ServiceNotFoundException {
++                        IBinder b = ServiceManager.getServiceOrThrow(
++                                Context.FEATURE_GATE_SERVICE);
++                        return new FeatureGateManager(ctx.getOuterContext(),
++                                IFeatureGateManager.Stub.asInterface(b));
++                    }});
++
+         registerService(Context.VIBRATOR_SERVICE, Vibrator.class,
+                 new CachedServiceFetcher<Vibrator>() {
+             @Override
+diff --git a/core/java/android/app/featuregate/FeatureGateManager.java b/core/java/android/app/featuregate/FeatureGateManager.java
+new file mode 100644
+index 000000000000..36d6dbb4e564
+--- /dev/null
++++ b/core/java/android/app/featuregate/FeatureGateManager.java
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app.featuregate;
++
++import android.annotation.NonNull;
++import android.content.Context;
++import android.app.featuregate.IFeatureGateManager;
++import android.os.RemoteException;
++
++import java.util.List;
++import java.util.Objects;
++
++/**
++ * Client API for FeatureGateService.
++ * Get it with {@code context.getSystemService(FeatureGateManager.class)}.
++ * @hide
++ */
++public class FeatureGateManager {
++        private final Context mContext;
++        private final IFeatureGateManager mService;
++
++    /** @hide */
++    public FeatureGateManager(@NonNull Context context, @NonNull IFeatureGateManager service) {
++        mContext = context;
++        mService = service;
++    }
++
++    /** Returns true if the feature is allowed right now. */
++    public boolean isFeatureAllowed(@NonNull String featureId) {
++        Objects.requireNonNull(featureId, "featureId");
++        try {
++            return mService.isFeatureAllowed(featureId);
++        } catch (RemoteException e) {
++            throw e.rethrowFromSystemServer();
++        }
++    }
++
++    /** Returns all current rules. */
++    @NonNull
++    public List<FeatureRule> getRules() {
++        try {
++            return mService.getRules();
++        } catch (RemoteException e) {
++            throw e.rethrowFromSystemServer();
++        }
++    }
++
++    /** Adds or replaces a rule. Admin only. */
++    public void setRule(@NonNull FeatureRule rule) {
++        Objects.requireNonNull(rule, "rule");
++        try {
++            mService.setRule(rule);
++        } catch (RemoteException e) {
++            throw e.rethrowFromSystemServer();
++        }
++    }
++
++    /** Removes the rule for a feature. Admin only. */
++    public void removeRule(@NonNull String featureId) {
++        Objects.requireNonNull(featureId, "featureId");
++        try {
++            mService.removeRule(featureId);
++        } catch (RemoteException e) {
++            throw e.rethrowFromSystemServer();
++        }
++    }
++
++}
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+new file mode 100644
+index 000000000000..8e91572ee11a
+--- /dev/null
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -0,0 +1,116 @@
++package com.android.server.featuregate;
++
++import android.app.featuregate.FeatureRule;
++import android.app.featuregate.IFeatureGateListener;
++import android.app.featuregate.IFeatureGateManager;
++import android.content.Context;
++import android.os.Binder;
++import android.os.Process;
++import android.os.RemoteCallbackList;
++import android.util.ArrayMap;
++import android.util.Slog;
++
++import com.android.internal.annotations.GuardedBy;
++import com.android.server.SystemService;
++
++import java.util.ArrayList;
++import java.util.List;
++public final class FeatureGateService extends SystemService {
++    private static final String TAG = "FeatureGateService";
++
++    private final Object mLock = new Object();
++
++    /** featureId -> rule. A feature with no rule is always allowed. */
++    @GuardedBy("mLock")
++    private final ArrayMap<String, FeatureRule> mRules = new ArrayMap<>();
++
++    //Battery state. Real values arrive in Battery receiver.
++    @GuardedBy("mLock")
++    private int mBatteryPercent = 100;
++    @GuardedBy("mLock")
++    boolean mCharging = false;
++
++    private final BinderService mBinderService = new BinderService();    /** App listeners. Dead clients are removed automatically */
++    private final RemoteCallbackList<IFeatureGateListener> mListeners = new RemoteCallbackList<>();
++
++    public FeatureGateService(Context context) {
++        super(context);
++    }
++
++    @Override
++    public void onStart() {
++        publishBinderService(Context.FEATURE_GATE_SERVICE, mBinderService);
++        Slog.i(TAG, "FeatureGateService started");
++    }
++
++    @GuardedBy("mLock")
++    private boolean isAllowedLocked(String featureId) {
++        final FeatureRule rule = mRules.get(featureId);
++        if (rule == null) {
++            Slog.i(TAG, "isAllowedLocked: Empty feature rule");
++            return true;
++        }
++        Slog.i(TAG, "isAllowedLocked: Feature rule found, checking ....");
++        return mBatteryPercent >= rule.getMinBatteryPercent() || (rule.getAllowWhenCharging() && mCharging);
++    }
++
++    /** Temporary admin checks until MANAGE_FEATURE_GATES permssion exists */
++    private static void enforceAdminCaller() {
++        final int uid = Binder.getCallingUid();
++        if(uid != Process.SYSTEM_UID && uid != Process.SHELL_UID && uid != Process.ROOT_UID) { throw new SecurityException("Uid" + uid + "man not change feature rules"); }
++    }
++
++    private final class BinderService extends IFeatureGateManager.Stub {
++        @Override
++        public boolean isFeatureAllowed(String featureId) {
++            if(featureId == null) throw new IllegalArgumentException("featureId is null");
++
++            synchronized(mLock) {
++                boolean isAllowed = isAllowedLocked(featureId);
++                Slog.i(TAG,"isFeatureAllowed: " + isAllowed);
++                return isAllowed;
++            }
++        }
++
++        @Override
++        public List<FeatureRule> getRules() {
++            synchronized (mLock) {
++                return new ArrayList<>(mRules.values());
++            }
++        }
++
++        @Override
++        public void setRule(FeatureRule rule) {
++            enforceAdminCaller();
++            if(rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty() || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) { throw new IllegalArgumentException("invalid rule: " + rule); }
++        }
++
++        @Override // Binder call: admin only
++        public void removeRule(String featureId) {
++            enforceAdminCaller();
++            if (featureId == null) {
++                throw new IllegalArgumentException("featureId is null");
++            }
++            synchronized (mLock) {
++                mRules.remove(featureId);
++            }
++            Slog.i(TAG, "removeRule " + featureId + " by uid " + Binder.getCallingUid());
++        }
++
++        @Override // Binder call
++        public void registerListener(IFeatureGateListener listener) {
++            if (listener == null) {
++                throw new IllegalArgumentException("listener is null");
++            }
++            mListeners.register(listener);
++        }
++
++        @Override // Binder call
++        public void unregisterListener(IFeatureGateListener listener) {
++            if (listener == null) {
++                throw new IllegalArgumentException("listener is null");
++            }
++            mListeners.unregister(listener);
++        }
++    }
++}
+diff --git a/services/java/com/android/server/SystemServer.java b/services/java/com/android/server/SystemServer.java
+index 92dbf63b3cf7..09b9af6e4cd2 100644
+--- a/services/java/com/android/server/SystemServer.java
++++ b/services/java/com/android/server/SystemServer.java
+@@ -320,6 +320,7 @@ import java.util.Timer;
+ import java.util.TreeSet;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.Future;
++import com.android.server.featuregate.FeatureGateService;
+ 
+ /**
+  * Entry point to {@code system_server}.
+@@ -1642,6 +1643,10 @@ public final class SystemServer implements Dumpable {
+                 t.traceEnd();
+             }
+ 
++            t.traceBegin("StartFeatureGateService");
++            mSystemServiceManager.startService(FeatureGateService.class);
++            t.traceEnd();
++
+             t.traceBegin("StartDynamicSystemService");
+             dynamicSystem = new DynamicSystemService(context);
+             ServiceManager.addService("dynamic_system", dynamicSystem);
+-- 
+2.53.0
+

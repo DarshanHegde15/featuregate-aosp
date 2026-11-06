@@ -1,0 +1,170 @@
+From de9791a687149a6cf14394e1f49ce7d3c5fc0ad2 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Thu, 5 Nov 2026 05:05:06 +0530
+Subject: [PATCH 11/13] FeatureGate: save rules to /data/system with AtomicFile
+
+FeatureGateStore writes rules as binary XML (with a version attribute)
+using AtomicFile, so a crash mid-write never corrupts the file. Writes
+are debounced (500 ms) and run on IoThread from a snapshot taken under
+the lock. /data/system is available before user unlock (Direct Boot).
+
+Change-Id: Icc440ed2eb69877720457d629bb2dde212a8b6ec
+---
+ .../featuregate/FeatureGateService.java       | 24 +++++-
+ .../server/featuregate/FeatureGateStore.java  | 74 +++++++++++++++++++
+ 2 files changed, 97 insertions(+), 1 deletion(-)
+ create mode 100644 services/core/java/com/android/server/featuregate/FeatureGateStore.java
+
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index e9534002f1f0..8feb4bf67631 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -13,6 +13,7 @@ import android.util.ArrayMap;
+ import android.util.Slog;
+ 
+ import com.android.internal.annotations.GuardedBy;
++import com.android.server.IoThread;
+ import com.android.server.SystemService;
+ 
+ import java.util.ArrayList;
+@@ -68,6 +69,10 @@ public final class FeatureGateService extends SystemService {
+     // featureId -> the enforcer responsible for it. Only modified in the constructor.
+     private final ArrayMap<String, FeatureEnforcer> mEnforcers = new ArrayMap<>();
+     private final BlockedNotifier mNotifier;
++    private static final long WRITE_DELAY_MS = 500;
++    private final FeatureGateStore mStore = new FeatureGateStore();
++    private final Handler mIoHandler = IoThread.getHandler();
++    private final Runnable mWriteRunnable = this::writeRulesNow;
+ 
+     private final BroadcastReceiver mBatteryReceiver = new BroadcastReceiver() {
+         @Override
+@@ -253,6 +258,21 @@ public final class FeatureGateService extends SystemService {
+         }
+     }
+ 
++    // Debounced: Many rules in a short time produce one write
++    private void scheduleWrite() {
++        mIoHandler.removeCallbacks(mWriteRunnable);
++        mIoHandler.postDelayed(mWriteRunnable, WRITE_DELAY_MS);
++    }
++
++    // Runs on IoThread. Snapshot under the lock, write outside it.
++    private void writeRulesNow() {
++        final List<FeatureRule> snapshot;
++        synchronized (mLock) {
++            snapshot = new ArrayList<>(mRules.values());
++        }
++        mStore.writeRules(snapshot);
++    }
++
+     private final class LocalService extends FeatureGateInternal {
+         @Override
+         public boolean isFeatureAllowed(String featureId) {
+@@ -313,6 +333,7 @@ public final class FeatureGateService extends SystemService {
+             }
+             Slog.i(TAG, "setRule " + rule + " by uid " + Binder.getCallingUid());
+             notifyListenerAsync(changes);
++            scheduleWrite();
+         }
+ 
+         @Override // Binder call: admin only
+@@ -331,6 +352,7 @@ public final class FeatureGateService extends SystemService {
+             }
+             Slog.i(TAG, "removeRule " + featureId + " by uid " + Binder.getCallingUid());
+             notifyListenerAsync(changes);
++            scheduleWrite();
+         }
+ 
+         @Override
+@@ -401,7 +423,7 @@ public final class FeatureGateService extends SystemService {
+                     case "set-rule": {
+                         final String id = getNextArgRequired();
+                         final int min = Integer.parseInt(getNextArgRequired());
+-                        final boolean whenCharging = Boolean.getBoolean(getNextArgRequired());
++                        final boolean whenCharging = Boolean.parseBoolean(getNextArgRequired());
+                         mBinderService.setRule(new FeatureRule(id, min, whenCharging));
+                         pw.println("OK");
+                         return 0;
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateStore.java b/services/core/java/com/android/server/featuregate/FeatureGateStore.java
+new file mode 100644
+index 000000000000..e91a367f3905
+--- /dev/null
++++ b/services/core/java/com/android/server/featuregate/FeatureGateStore.java
+@@ -0,0 +1,74 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.featuregate;
++
++import android.app.featuregate.FeatureRule;
++import android.os.Environment;
++import android.util.AtomicFile;
++import android.util.Slog;
++import android.util.Xml;
++
++import com.android.modules.utils.TypedXmlSerializer;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.util.List;
++
++// Saves FeatureGate rules to /data/system/featuregate/rules.xml (available before user logs in, at boot)
++// Must be called on IoThread, never with FeatureGate's lock held.
++final class FeatureGateStore {
++    private static final String TAG = "FeatureGate.Store";
++    private static final int VERSION = 1;
++    private static final String TAG_RULES = "rules";
++    private static final String TAG_RULE = "rule";
++    private static final String ATTR_VERSION = "version";
++    private static final String ATTR_ID = "id";
++    private static final String ATTR_MIN = "minBattery";
++    private static final String ATTR_CHARGING = "allowWhenCharging";
++
++    private final File mDir = new File(Environment.getDataSystemDirectory(), "featuregate");
++    private final AtomicFile mFile = new AtomicFile(new File(mDir, "rules.xml"));
++
++    void writeRules(List<FeatureRule> rules) {
++        mDir.mkdirs();
++        FileOutputStream fos = null;
++        try {
++            fos = mFile.startWrite();
++            final TypedXmlSerializer out = Xml.resolveSerializer(fos);
++            out.startDocument(null, true);
++            out.startTag(null, TAG_RULES);
++            out.attributeInt(null, ATTR_VERSION, VERSION);
++            for (FeatureRule r : rules) {
++                out.startTag(null, TAG_RULE);
++                out.attribute(null, ATTR_ID, r.getFeatureId());
++                out.attributeInt(null, ATTR_MIN, r.getMinBatteryPercent());
++                out.attributeBoolean(null, ATTR_CHARGING, r.getAllowWhenCharging());
++                out.endTag(null, TAG_RULE);
++            }
++            out.endTag(null, TAG_RULES);
++            out.endDocument();
++            mFile.finishWrite(fos);
++            Slog.i(TAG, "Saved " + rules.size() + " rules");
++        } catch (IOException e) {
++            Slog.e(TAG, "Failed to save rules", e);
++            if(fos != null) {
++                mFile.failWrite(fos);
++            }
++        }
++    }
++}
+-- 
+2.53.0
+

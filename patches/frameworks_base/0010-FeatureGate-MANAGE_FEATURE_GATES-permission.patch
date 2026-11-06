@@ -1,0 +1,95 @@
+From 1d7c5bfe4de193ef19dd7c0c8c3eb3fb401bd8ab Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Mon, 2 Nov 2026 08:05:44 +0530
+Subject: [PATCH 10/13] FeatureGate: MANAGE_FEATURE_GATES permission
+
+Declares android.permission.MANAGE_FEATURE_GATES (@hide,
+signature|privileged) and enforces it in setRule/removeRule with
+enforceCallingOrSelfPermission, replacing the temporary UID allow-list.
+Shell is granted it for cmd feature_gate testing.
+
+Change-Id: I60c7b980b7a767ef7f6e60c4c8e121db51d8416c
+---
+ core/res/AndroidManifest.xml                       |  6 ++++++
+ packages/Shell/AndroidManifest.xml                 |  2 ++
+ .../server/featuregate/FeatureGateService.java     | 14 ++++++--------
+ 3 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/core/res/AndroidManifest.xml b/core/res/AndroidManifest.xml
+index 6b8056c77fda..def5f1997a65 100644
+--- a/core/res/AndroidManifest.xml
++++ b/core/res/AndroidManifest.xml
+@@ -5244,6 +5244,12 @@
+     <permission android:name="android.permission.STATUS_BAR"
+         android:protectionLevel="signature|privileged|recents" />
+ 
++    <!-- @hide Allows an application to create, change and remove FeaturGater rules.
++         <p> Protection level: signature|privileged
++         -->
++    <permission android:name="android.permission.MANAGE_FEATURE_GATES"
++        android:protectionLevel="signature|privileged" />
++
+     <!-- Allows an application to trigger bugreport via shell using the bugreport API.
+         <p>Not for use by third-party applications.
+         @hide
+diff --git a/packages/Shell/AndroidManifest.xml b/packages/Shell/AndroidManifest.xml
+index 65f487765c1e..6e2b4bd19cd4 100644
+--- a/packages/Shell/AndroidManifest.xml
++++ b/packages/Shell/AndroidManifest.xml
+@@ -993,6 +993,8 @@
+     <uses-permission android:name="android.permission.ACCESS_TEXT_CLASSIFIER_BY_TYPE"
+         android:featureFlag="android.permission.flags.text_classifier_choice_api_enabled"/>
+ 
++    <uses-permission android:name="android.permission.MANAGE_FEATURE_GATES" />
++
+     <application
+         android:label="@string/app_label"
+         android:theme="@android:style/Theme.DeviceDefault.DayNight"
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index 962dbc43dcfa..e9534002f1f0 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -1,5 +1,6 @@
+ package com.android.server.featuregate;
+ 
++import android.Manifest;
+ import android.app.featuregate.FeatureRule;
+ import android.app.featuregate.IFeatureGateListener;
+ import android.app.featuregate.IFeatureGateManager;
+@@ -237,12 +238,9 @@ public final class FeatureGateService extends SystemService {
+         }
+     }
+ 
+-    /** Temporary admin checks until MANAGE_FEATURE_GATES permssion exists */
+-    private static void enforceAdminCaller() {
+-        final int uid = Binder.getCallingUid();
+-        if (uid != Process.SYSTEM_UID && uid != Process.SHELL_UID && uid != Process.ROOT_UID) {
+-            throw new SecurityException("Uid" + uid + "man not change feature rules");
+-        }
++    // Callers must hold MANAGE_FEATURE_GATES (root and system always pass).
++    private void enforceManagePermission(String operation) {
++        getContext().enforceCallingOrSelfPermission(Manifest.permission.MANAGE_FEATURE_GATES,operation);
+     }
+ 
+     // Call only from the constructor, before any battery or rule work is done.
+@@ -296,7 +294,7 @@ public final class FeatureGateService extends SystemService {
+ 
+         @Override
+         public void setRule(FeatureRule rule) {
+-            enforceAdminCaller(); // 1. Permission first
++            enforceManagePermission("setRule"); // 1. Permission first
+             if (rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty()
+                     || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) {
+                 throw new IllegalArgumentException("invalid rule: " + rule);
+@@ -319,7 +317,7 @@ public final class FeatureGateService extends SystemService {
+ 
+         @Override // Binder call: admin only
+         public void removeRule(String featureId) {
+-            enforceAdminCaller();
++            enforceManagePermission("removeRule");
+             mCatalog.enforceValid(featureId);
+ 
+             final ArrayMap<String, Boolean> changes;
+-- 
+2.53.0
+

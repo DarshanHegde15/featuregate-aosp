@@ -1,0 +1,129 @@
+From 06c903a03bdb6dbc9d98800137243ed921de0e71 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Thu, 5 Nov 2026 15:53:29 +0530
+Subject: [PATCH 12/13] FeatureGate: load saved rules at boot
+
+Rules are read in onStart() before the binder is published, so callers
+never see an empty rule set. A missing, corrupt or newer-version file
+starts empty instead of crashing system_server; invalid saved rules
+(unknown feature, uninstalled app, bad battery value) are skipped.
+Enforcers sync from the first sticky battery broadcast.
+
+Change-Id: I90fe27948f15baa57af471fc3b383e0969acfeb3
+---
+ .../featuregate/FeatureGateService.java       | 32 +++++++++++++++
+ .../server/featuregate/FeatureGateStore.java  | 40 +++++++++++++++++++
+ 2 files changed, 72 insertions(+)
+
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index 8feb4bf67631..381488b30a85 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -95,11 +95,43 @@ public final class FeatureGateService extends SystemService {
+ 
+     @Override
+     public void onStart() {
++        loadRules();
+         publishBinderService(Context.FEATURE_GATE_SERVICE, mBinderService); //For apps
+         publishLocalService(FeatureGateInternal.class, new LocalService()); //For system_server
+         Slog.i(TAG, "FeatureGateService started");
+     }
+ 
++    private void loadRules() {
++        final List<FeatureRule> saved = mStore.readRules();
++        int skipped = 0;
++        synchronized (mLock) {
++            for (FeatureRule r : saved) {
++                if (isValidSavedRule(r)) {
++                    mRules.put(r.getFeatureId(), r);
++                } else {
++                    skipped++;
++                }
++            }
++            if(skipped > 0) {
++                Slog.w(TAG, "Skipped " + skipped + " invalid saved rules");
++            }
++        }
++    }
++
++    // A saved rule can go stale: feature removed in an update, app uninstalled, bad value.
++    private boolean isValidSavedRule(FeatureRule r) {
++        final int min = r.getMinBatteryPercent();
++        if(min < 0 || min > 100) {
++            return false;
++        }
++        try {
++            mCatalog.enforceValid(r.getFeatureId()); // Use your method's exact signature
++            return true;
++        } catch (ServiceSpecificException e) {
++            return false;
++        }
++    }
++
+     @Override
+     public void onBootPhase(int phase) {
+         if (phase == PHASE_SYSTEM_SERVICES_READY) {
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateStore.java b/services/core/java/com/android/server/featuregate/FeatureGateStore.java
+index e91a367f3905..5bf08d14f428 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateStore.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateStore.java
+@@ -22,11 +22,18 @@ import android.util.AtomicFile;
+ import android.util.Slog;
+ import android.util.Xml;
+ 
++import com.android.modules.utils.TypedXmlPullParser;
+ import com.android.modules.utils.TypedXmlSerializer;
+ 
++import org.xmlpull.v1.XmlPullParser;
++import org.xmlpull.v1.XmlPullParserException;
++
+ import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileNotFoundException;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.List;
+ 
+ // Saves FeatureGate rules to /data/system/featuregate/rules.xml (available before user logs in, at boot)
+@@ -71,4 +78,37 @@ final class FeatureGateStore {
+             }
+         }
+     }
++
++    // Returns the saved rules, or an empty list if the file is missing or unreadable
++    List<FeatureRule> readRules() {
++        final List<FeatureRule> rules = new ArrayList<>();
++        try (FileInputStream fis = mFile.openRead()) {
++            final TypedXmlPullParser in = Xml.resolvePullParser(fis);
++            int type;
++            while ((type = in.next()) != TypedXmlPullParser.END_DOCUMENT) {
++                if (type != XmlPullParser.START_TAG) continue;
++                if (TAG_RULES.equals(in.getName())) {
++                    final int version = in.getAttributeInt(null, ATTR_VERSION, -1);
++                    if(version > VERSION) {
++                        Slog.w(TAG, "Rules file version: " + version + " is newer than " + VERSION + ", ignoring it");
++                        return new ArrayList<>();
++                    }
++                } else if (TAG_RULE.equals(in.getName())) {
++                    final String id = in.getAttributeValue(null, ATTR_ID);
++                    final int min = in.getAttributeInt(null, ATTR_MIN, -1);
++                    final boolean charging = in.getAttributeBoolean(null, ATTR_CHARGING, false);
++                    if(id != null){
++                        rules.add(new FeatureRule(id, min, charging));
++                    }
++                }
++            }
++            Slog.i(TAG, "Loaded " + rules.size() + " rules");
++        } catch (FileNotFoundException e) {
++            Slog.i(TAG, "No rules file yet, starting empty");
++        } catch (IOException | XmlPullParserException | RuntimeException e) {
++            Slog.e(TAG, "Rules file unreadable, starting empty", e);
++            rules.clear();
++        }
++        return rules;
++    }
+ }
+-- 
+2.53.0
+
