@@ -1,7 +1,7 @@
 From 7e7ae3e80efeb45196a1bb7a5aa0e36d2226edd8 Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Sat, 17 Oct 2026 18:03:18 +0530
-Subject: [PATCH] FeatureGate: label feature_gate service
+Subject: [PATCH 1/2] FeatureGate: label feature_gate service
 
 Adds feature_gate_service (private type) so system_server can add
 and apps can find the feature_gate service.

@@ -1,6 +1,7 @@
 package com.android.server.featuregate;
 
 import android.Manifest;
+import android.app.featuregate.FeatureGateManager;
 import android.app.featuregate.FeatureRule;
 import android.app.featuregate.IFeatureGateListener;
 import android.app.featuregate.IFeatureGateManager;
@@ -75,6 +76,7 @@ public final class FeatureGateService extends SystemService {
     private final Runnable mWriteRunnable = this::writeRulesNow;
     private RestrictionNotifier mRestrictionNotifier;
     private Boolean mBootCompleted;
+    private final AppEnforcer mAppEnforcer;
 
     private final BroadcastReceiver mBatteryReceiver = new BroadcastReceiver() {
         @Override
@@ -87,6 +89,7 @@ public final class FeatureGateService extends SystemService {
         super(context);
         registerEnforcer(new SystemUiEnforcer(context));
         registerEnforcer(new CameraEnforcer());
+        mAppEnforcer = new AppEnforcer(context);
         mCatalog = new FeatureCatalog(context);
         mHandlerThread = new ServiceThread(TAG, Process.THREAD_PRIORITY_BACKGROUND,
                 false /* allowIo */);
@@ -141,8 +144,25 @@ public final class FeatureGateService extends SystemService {
             registerBatteryReceiver();
             mHandler.post(() -> {
                 mBootCompleted = true;
+                syncAppEnforcer();
                 updateRestrictionNotification();
             });
+        }
+    }
+
+    // PackageManager keeps suspension across reboots, so "everything allowed" is not a safe
+    // starting assumptions for apps. Apply the real state of every app rule once.
+    private void syncAppEnforcer() {
+        final ArrayMap<String, Boolean> state = new ArrayMap<>();
+        synchronized (mLock) {
+            for (FeatureRule r : mRules.values()) {
+                if (r.getFeatureId().startsWith(FeatureGateManager.APP_PREFIX)) {
+                    state.put(r.getFeatureId(), isAllowedLocked(r.getFeatureId()));
+                }
+            }
+        }
+        for (int i = 0; i < state.size(); i++) {
+            mAppEnforcer.onFeatureStateChanged(state.keyAt(i), state.valueAt(i));
         }
     }
 
@@ -267,7 +287,7 @@ public final class FeatureGateService extends SystemService {
         for (int j = 0; j < changes.size(); j++) {
             final String featureId = changes.keyAt(j);
             final boolean allowed = changes.valueAt(j);
-            final FeatureEnforcer enforcer = mEnforcers.get(featureId);
+            final FeatureEnforcer enforcer = enforcerFor(featureId);
             if (enforcer == null) {
                 Slog.i(TAG, "No enforcer yet for " + featureId + " (" + (allowed ? "ALLOWED" : "BLOCKED") +")");
                 continue;
@@ -281,6 +301,11 @@ public final class FeatureGateService extends SystemService {
                 Slog.e(TAG, "enforcer " + enforcer.getName() + " failed for " + featureId, e);
             }
         }
+    }
+
+    private FeatureEnforcer enforcerFor(String featureId) {
+        if (featureId.startsWith(FeatureGateManager.APP_PREFIX)) return mAppEnforcer;
+        return mEnforcers.get(featureId);
     }
 
     // Callers must hold MANAGE_FEATURE_GATES (root and system always pass).
@@ -453,11 +478,13 @@ public final class FeatureGateService extends SystemService {
             for (int i = 0; i < mEnforcers.size(); i++) {
                 pw.println("    " + mEnforcers.keyAt(i) + " -> " + mEnforcers.valueAt(i).getName());
             }
+            pw.println("    " + FeatureGateManager.APP_PREFIX + "* -> " + mAppEnforcer.getName());
             pw.println("  enforcer state:");
             final ArraySet<FeatureEnforcer> unique = new ArraySet<>(mEnforcers.values());
             for(int i = 0; i < unique.size(); i++) {
                 unique.valueAt(i).dump(pw);
             }
+            mAppEnforcer.dump(pw);
             pw.println(" listeners: "+ mListeners.getRegisteredCallbackCount());
         }
 

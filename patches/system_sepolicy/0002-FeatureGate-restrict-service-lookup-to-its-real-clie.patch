@@ -1,0 +1,46 @@
+From 8de49deab1fcb7955711c58b7ab33e9a12435bd8 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <96007698+DarshanHegde15@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 11:56:55 +0530
+Subject: [PATCH 2/2] FeatureGate: restrict service lookup to its real clients
+
+feature_gate_service is no longer an app_api_service: only platform_app
+(the admin console) and shell may find it. A neverallow guarantees
+third-party apps can never be granted access. Permission checks in the
+service remain as the second layer.
+
+Change-Id: I6514eb4ea68073ccb4cec9b5dc17da29fdbee837
+---
+ private/feature_gate.te | 7 +++++++
+ private/service.te      | 2 +-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+ create mode 100644 private/feature_gate.te
+
+diff --git a/private/feature_gate.te b/private/feature_gate.te
+new file mode 100644
+index 000000000..0bdb39dbb
+--- /dev/null
++++ b/private/feature_gate.te
+@@ -0,0 +1,7 @@
++# FeatureGate service access.
++# Only the admin console (platform-signed app) may look it up: shell already can (shell.te).
++
++allow platform_app feature_gate_service:service_manager find;
++
++# Third-party apps must never reach FeatureGate service, even if someone adds a rule later.
++neverallow untrusted_app_all feature_gate_service:service_manager find;
+diff --git a/private/service.te b/private/service.te
+index a6ccc04ba..b575431bb 100644
+--- a/private/service.te
++++ b/private/service.te
+@@ -11,7 +11,7 @@ type compos_service,                 service_manager_type;
+ type communal_service,               app_api_service, system_server_service, service_manager_type;
+ type dynamic_system_service,         system_api_service, system_server_service, service_manager_type;
+ type feature_flags_service,          app_api_service, system_server_service, service_manager_type;
+-type feature_gate_service,           app_api_service, system_server_service, service_manager_type;
++type feature_gate_service,           system_server_service, service_manager_type;
+ type fwk_devicestate_service, system_server_service, service_manager_type;
+ type gsi_service,                    service_manager_type;
+ type incidentcompanion_service,      app_api_service, system_api_service, system_server_service, service_manager_type;
+-- 
+2.53.0
+
