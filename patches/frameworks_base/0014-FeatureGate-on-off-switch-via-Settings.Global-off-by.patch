@@ -1,0 +1,343 @@
+From 566e5105b41cdc5f694e091da574b8566325c0d9 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <96007698+DarshanHegde15@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 12:14:20 +0530
+Subject: [PATCH 14/14] FeatureGate: on/off switch via Settings.Global (off by
+ default)
+
+FEATURE_GATE_ENABLED is read at boot phase 500 and observed with a
+ContentObserver. When off, the service is dormant: every feature is
+allowed (enforcers lift all blocks through the normal diff path),
+rule changes and listener registration are refused with
+ERROR_SERVICE_DISABLED (IllegalStateException in the manager), and
+saved rules are kept for when it is switched back on.
+
+Change-Id: I7a970b700d82024e296b03af603025dd0e050879
+---
+ .../app/featuregate/FeatureGateManager.java   |  7 +-
+ .../app/featuregate/IFeatureGateManager.aidl  |  1 +
+ core/java/android/provider/Settings.java      |  6 ++
+ .../server/featuregate/AppEnforcer.java       | 79 +++++++++++++++++++
+ .../featuregate/FeatureGateService.java       | 75 +++++++++++++++++-
+ 5 files changed, 164 insertions(+), 4 deletions(-)
+ create mode 100644 services/core/java/com/android/server/featuregate/AppEnforcer.java
+
+diff --git a/core/java/android/app/featuregate/FeatureGateManager.java b/core/java/android/app/featuregate/FeatureGateManager.java
+index def5c05bdaa7..258a98c97434 100644
+--- a/core/java/android/app/featuregate/FeatureGateManager.java
++++ b/core/java/android/app/featuregate/FeatureGateManager.java
+@@ -127,10 +127,11 @@ public class FeatureGateManager {
+ 
+     /** Turns the service's error into a normal Java exception for apps. */
+     private static RuntimeException translate(ServiceSpecificException e) {
+-        if(e.errorCode == IFeatureGateManager.ERROR_UNKNOWN_FEATURE) {
+-            return new IllegalArgumentException(e.getMessage());
++        switch (e.errorCode) {
++            case IFeatureGateManager.ERROR_UNKNOWN_FEATURE: return new IllegalArgumentException(e.getMessage());
++            case IFeatureGateManager.ERROR_SERVICE_DISABLED: return new IllegalStateException(e.getMessage());
++            default: return new RuntimeException(e);
+         }
+-        return e;
+     }
+ 
+     /** Receives feature state changes. Plain Java interface: apps never see AIDL. */
+diff --git a/core/java/android/app/featuregate/IFeatureGateManager.aidl b/core/java/android/app/featuregate/IFeatureGateManager.aidl
+index 67a3b0c98f06..e514d7a983ce 100644
+--- a/core/java/android/app/featuregate/IFeatureGateManager.aidl
++++ b/core/java/android/app/featuregate/IFeatureGateManager.aidl
+@@ -12,6 +12,7 @@ import android.app.featuregate.IFeatureGateListener;
+ interface IFeatureGateManager {
+     /** Error code for SystemSpecificException: no rule exists for this feature */
+     const int ERROR_UNKNOWN_FEATURE = 1;
++    const int ERROR_SERVICE_DISABLED = 2;
+ 
+     //---- Quaries: Open to all apps ----
+     boolean isFeatureAllowed(String featureId);
+diff --git a/core/java/android/provider/Settings.java b/core/java/android/provider/Settings.java
+index 4acb6312f90d..1bf0b7914e57 100644
+--- a/core/java/android/provider/Settings.java
++++ b/core/java/android/provider/Settings.java
+@@ -19482,6 +19482,12 @@ public final class Settings {
+          */
+         public static final String REPAIR_MODE_ACTIVE = "repair_mode_active";
+ 
++        /**
++         *  Whether FeatureGate enforcement is on (1) or off (0, default).
++         * @hide
++         */
++        public static final String FEATURE_GATE_ENABLED = "feature_gate_enabled";
++
+         /**
+          * Settings migrated from Wear OS settings provider.
+          * @hide
+diff --git a/services/core/java/com/android/server/featuregate/AppEnforcer.java b/services/core/java/com/android/server/featuregate/AppEnforcer.java
+new file mode 100644
+index 000000000000..0baaa22a283f
+--- /dev/null
++++ b/services/core/java/com/android/server/featuregate/AppEnforcer.java
+@@ -0,0 +1,79 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.featuregate;
++
++import android.app.featuregate.FeatureGateManager;
++import android.content.Context;
++import android.content.pm.SuspendDialogInfo;
++import android.util.ArraySet;
++import android.util.Slog;
++
++import java.io.PrintWriter;
++import java.util.Collections;
++import java.util.Set;
++
++// Suspends for "app:<package>" rules through PackageManager.
++// Called on FeatureGate's handler thread, never with the service lock held.
++final class AppEnforcer implements FeatureEnforcer{
++    private static final String TAG = "FeatureGate.App";
++    private final Context mContext;
++    // Packages FeatureGate itself suspended. Touched only on the handler thread.
++    private final ArraySet<String> mSuspended = new ArraySet<>();
++
++    AppEnforcer(Context context) {
++        mContext = context;
++    }
++
++    @Override
++    public String getName() {
++        return "AppEnforcer";
++    }
++
++    // App ids are dynamic ("app:<pkg>"), so none are registered upfront; the service routes by prefix
++    @Override
++    public Set<String> getHandledFeatures() {
++        return Collections.emptySet();
++    }
++
++    @Override
++    public void onFeatureStateChanged(String featureId, boolean allowed) {
++        final String pkg = featureId.substring(FeatureGateManager.APP_PREFIX.length());
++        final SuspendDialogInfo dialog = allowed ? null : new SuspendDialogInfo.Builder().setMessage("Blocked by FeatureGate: Battery too low").build();
++        final String[] failed;
++        try {
++            failed = mContext.getPackageManager().setPackagesSuspended(new String[] {pkg}, !allowed, null, null, dialog);
++        } catch(RuntimeException e){
++            Slog.w(TAG, "setPackageSuspended failed for " + pkg, e);;
++            return;
++        }
++        if (failed != null && failed.length == 0) {
++            Slog.w(TAG, "PackageManager refused to " + (allowed ? "unsuspend " : "suspend ") + pkg);
++            return;
++        }
++        if (allowed) {
++            mSuspended.remove(pkg);
++        } else {
++            mSuspended.add(pkg);
++        }
++        Slog.i(TAG, pkg + (allowed ? " unsuspended " : " suspended "));
++    }
++
++    @Override
++    public void dump(PrintWriter pw) {
++        pw.println("    " + getName() + ": suspended=" + mSuspended);
++    }
++}
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index fd50fdc9eb37..0d0eabbce847 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -1,14 +1,18 @@
+ package com.android.server.featuregate;
+ 
+ import android.Manifest;
++import android.app.featuregate.FeatureGateManager;
+ import android.app.featuregate.FeatureRule;
+ import android.app.featuregate.IFeatureGateListener;
+ import android.app.featuregate.IFeatureGateManager;
++import android.content.ContentResolver;
++import android.database.ContentObserver;
+ import android.os.ServiceSpecificException;
+ import android.content.Context;
+ import android.os.Binder;
+ import android.os.Process;
+ import android.os.RemoteCallbackList;
++import android.provider.Settings;
+ import android.util.ArrayMap;
+ import android.util.Slog;
+ 
+@@ -75,6 +79,9 @@ public final class FeatureGateService extends SystemService {
+     private final Runnable mWriteRunnable = this::writeRulesNow;
+     private RestrictionNotifier mRestrictionNotifier;
+     private Boolean mBootCompleted;
++    private final AppEnforcer mAppEnforcer;
++    // From Settings.Global.FEATURE_GATE_ENABLED. Off until read at phase 500
++    private boolean mEnabled;
+ 
+     private final BroadcastReceiver mBatteryReceiver = new BroadcastReceiver() {
+         @Override
+@@ -87,6 +94,7 @@ public final class FeatureGateService extends SystemService {
+         super(context);
+         registerEnforcer(new SystemUiEnforcer(context));
+         registerEnforcer(new CameraEnforcer());
++        mAppEnforcer = new AppEnforcer(context);
+         mCatalog = new FeatureCatalog(context);
+         mHandlerThread = new ServiceThread(TAG, Process.THREAD_PRIORITY_BACKGROUND,
+                 false /* allowIo */);
+@@ -138,14 +146,67 @@ public final class FeatureGateService extends SystemService {
+     @Override
+     public void onBootPhase(int phase) {
+         if (phase == PHASE_SYSTEM_SERVICES_READY) {
++            final ContentResolver cr = getContext().getContentResolver();
++            cr.registerContentObserver(
++                    Settings.Global.getUriFor(Settings.Global.FEATURE_GATE_ENABLED),
++                    false,
++                    new ContentObserver(mHandler) { // Callbacks on our thread
++                        @Override
++                        public void onChange(boolean selfChange) {
++                            onEnabledSettingsChanged();
++                        }
++                    });
++            onEnabledSettingsChanged();
+             registerBatteryReceiver();
+             mHandler.post(() -> {
+                 mBootCompleted = true;
++                syncAppEnforcer();
+                 updateRestrictionNotification();
+             });
+         }
+     }
+ 
++    // Called at phase 500 and whenever the setings changes (on mHandler).
++    private void onEnabledSettingsChanged() {
++        // Read outside the lock: it's a call into SettingsProvider.
++        final boolean enabled = Settings.Global.getInt(getContext().getContentResolver(),Settings.Global.FEATURE_GATE_ENABLED, 0) == 1;
++
++        final ArrayMap<String, Boolean> changes;
++        synchronized (mLock) {
++            if (enabled == mEnabled) return;
++            final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
++            final ArrayMap<String, Boolean> before = snapshotLocked(ids);
++            mEnabled = enabled;
++            changes = diffLocked(ids, before);
++        }
++        Slog.i(TAG,"FeatureGate " + (enabled ? "enabled" : "disabled") + " by Settings");
++        notifyListenerAsync(changes);
++    }
++
++    private void enforceEnabled() {
++        synchronized (mLock) {
++            if(!mEnabled) {
++                throw new ServiceSpecificException(IFeatureGateManager.ERROR_SERVICE_DISABLED,"FeatureGate is disabled in Settings");
++            }
++        }
++    }
++
++    // PackageManager keeps suspension across reboots, so "everything allowed" is not a safe
++    // starting assumptions for apps. Apply the real state of every app rule once.
++    private void syncAppEnforcer() {
++        final ArrayMap<String, Boolean> state = new ArrayMap<>();
++        synchronized (mLock) {
++            for (FeatureRule r : mRules.values()) {
++                if (r.getFeatureId().startsWith(FeatureGateManager.APP_PREFIX)) {
++                    state.put(r.getFeatureId(), isAllowedLocked(r.getFeatureId()));
++                }
++            }
++        }
++        for (int i = 0; i < state.size(); i++) {
++            mAppEnforcer.onFeatureStateChanged(state.keyAt(i), state.valueAt(i));
++        }
++    }
++
+     private void registerBatteryReceiver() {
+         final IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+         // Sticky boradcast: returns the latest battery intent immediately.
+@@ -189,6 +250,7 @@ public final class FeatureGateService extends SystemService {
+ 
+     @GuardedBy("mLock")
+     private boolean isAllowedLocked(String featureId) {
++        if (!mEnabled) return true;
+         final FeatureRule rule = mRules.get(featureId);
+         if (rule == null) {
+             Slog.i(TAG, "isAllowedLocked: Empty feature rule");
+@@ -267,7 +329,7 @@ public final class FeatureGateService extends SystemService {
+         for (int j = 0; j < changes.size(); j++) {
+             final String featureId = changes.keyAt(j);
+             final boolean allowed = changes.valueAt(j);
+-            final FeatureEnforcer enforcer = mEnforcers.get(featureId);
++            final FeatureEnforcer enforcer = enforcerFor(featureId);
+             if (enforcer == null) {
+                 Slog.i(TAG, "No enforcer yet for " + featureId + " (" + (allowed ? "ALLOWED" : "BLOCKED") +")");
+                 continue;
+@@ -283,6 +345,11 @@ public final class FeatureGateService extends SystemService {
+         }
+     }
+ 
++    private FeatureEnforcer enforcerFor(String featureId) {
++        if (featureId.startsWith(FeatureGateManager.APP_PREFIX)) return mAppEnforcer;
++        return mEnforcers.get(featureId);
++    }
++
+     // Callers must hold MANAGE_FEATURE_GATES (root and system always pass).
+     private void enforceManagePermission(String operation) {
+         getContext().enforceCallingOrSelfPermission(Manifest.permission.MANAGE_FEATURE_GATES,operation);
+@@ -373,6 +440,7 @@ public final class FeatureGateService extends SystemService {
+         @Override
+         public void setRule(FeatureRule rule) {
+             enforceManagePermission("setRule"); // 1. Permission first
++            enforceEnabled();
+             if (rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty()
+                     || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) {
+                 throw new IllegalArgumentException("invalid rule: " + rule);
+@@ -397,6 +465,7 @@ public final class FeatureGateService extends SystemService {
+         @Override // Binder call: admin only
+         public void removeRule(String featureId) {
+             enforceManagePermission("removeRule");
++            enforceEnabled();
+             mCatalog.enforceValid(featureId);
+ 
+             final ArrayMap<String, Boolean> changes;
+@@ -423,6 +492,7 @@ public final class FeatureGateService extends SystemService {
+             if (listener == null) {
+                 throw new IllegalArgumentException("listener is null");
+             }
++            enforceEnabled();
+             mListeners.register(listener);
+         }
+ 
+@@ -440,6 +510,7 @@ public final class FeatureGateService extends SystemService {
+ 
+             synchronized (mLock) {
+                 pw.println("FeatureGate state: ");
++                pw.print(" enabled: " + mEnabled);
+                 pw.println(" battery: " + (mBatteryKnown ? mBatteryPercent + "%" : "unknown")
+                         + ", charging: " + mCharging);
+                 pw.println(" rules (" + mRules.size() + "):");
+@@ -453,11 +524,13 @@ public final class FeatureGateService extends SystemService {
+             for (int i = 0; i < mEnforcers.size(); i++) {
+                 pw.println("    " + mEnforcers.keyAt(i) + " -> " + mEnforcers.valueAt(i).getName());
+             }
++            pw.println("    " + FeatureGateManager.APP_PREFIX + "* -> " + mAppEnforcer.getName());
+             pw.println("  enforcer state:");
+             final ArraySet<FeatureEnforcer> unique = new ArraySet<>(mEnforcers.values());
+             for(int i = 0; i < unique.size(); i++) {
+                 unique.valueAt(i).dump(pw);
+             }
++            mAppEnforcer.dump(pw);
+             pw.println(" listeners: "+ mListeners.getRegisteredCallbackCount());
+         }
+ 
+-- 
+2.53.0
+

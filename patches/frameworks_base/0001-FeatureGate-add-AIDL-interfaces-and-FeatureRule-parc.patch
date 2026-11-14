@@ -1,7 +1,7 @@
 From 6b798f6bb207aad3c98a29fc940b85c5711f9aaa Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Sun, 11 Oct 2026 16:22:39 +0530
-Subject: [PATCH 01/13] FeatureGate: add AIDL interfaces and FeatureRule
+Subject: [PATCH 01/14] FeatureGate: add AIDL interfaces and FeatureRule
  parcelable
 
 Adds IFeatureGateManager (service interface), IFeatureGateListener

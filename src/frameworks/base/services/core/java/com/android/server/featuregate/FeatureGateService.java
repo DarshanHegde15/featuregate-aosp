@@ -5,11 +5,14 @@ import android.app.featuregate.FeatureGateManager;
 import android.app.featuregate.FeatureRule;
 import android.app.featuregate.IFeatureGateListener;
 import android.app.featuregate.IFeatureGateManager;
+import android.content.ContentResolver;
+import android.database.ContentObserver;
 import android.os.ServiceSpecificException;
 import android.content.Context;
 import android.os.Binder;
 import android.os.Process;
 import android.os.RemoteCallbackList;
+import android.provider.Settings;
 import android.util.ArrayMap;
 import android.util.Slog;
 
@@ -77,6 +80,8 @@ public final class FeatureGateService extends SystemService {
     private RestrictionNotifier mRestrictionNotifier;
     private Boolean mBootCompleted;
     private final AppEnforcer mAppEnforcer;
+    // From Settings.Global.FEATURE_GATE_ENABLED. Off until read at phase 500
+    private boolean mEnabled;
 
     private final BroadcastReceiver mBatteryReceiver = new BroadcastReceiver() {
         @Override
@@ -141,12 +146,48 @@ public final class FeatureGateService extends SystemService {
     @Override
     public void onBootPhase(int phase) {
         if (phase == PHASE_SYSTEM_SERVICES_READY) {
+            final ContentResolver cr = getContext().getContentResolver();
+            cr.registerContentObserver(
+                    Settings.Global.getUriFor(Settings.Global.FEATURE_GATE_ENABLED),
+                    false,
+                    new ContentObserver(mHandler) { // Callbacks on our thread
+                        @Override
+                        public void onChange(boolean selfChange) {
+                            onEnabledSettingsChanged();
+                        }
+                    });
+            onEnabledSettingsChanged();
             registerBatteryReceiver();
             mHandler.post(() -> {
                 mBootCompleted = true;
                 syncAppEnforcer();
                 updateRestrictionNotification();
             });
+        }
+    }
+
+    // Called at phase 500 and whenever the setings changes (on mHandler).
+    private void onEnabledSettingsChanged() {
+        // Read outside the lock: it's a call into SettingsProvider.
+        final boolean enabled = Settings.Global.getInt(getContext().getContentResolver(),Settings.Global.FEATURE_GATE_ENABLED, 0) == 1;
+
+        final ArrayMap<String, Boolean> changes;
+        synchronized (mLock) {
+            if (enabled == mEnabled) return;
+            final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
+            final ArrayMap<String, Boolean> before = snapshotLocked(ids);
+            mEnabled = enabled;
+            changes = diffLocked(ids, before);
+        }
+        Slog.i(TAG,"FeatureGate " + (enabled ? "enabled" : "disabled") + " by Settings");
+        notifyListenerAsync(changes);
+    }
+
+    private void enforceEnabled() {
+        synchronized (mLock) {
+            if(!mEnabled) {
+                throw new ServiceSpecificException(IFeatureGateManager.ERROR_SERVICE_DISABLED,"FeatureGate is disabled in Settings");
+            }
         }
     }
 
@@ -209,6 +250,7 @@ public final class FeatureGateService extends SystemService {
 
     @GuardedBy("mLock")
     private boolean isAllowedLocked(String featureId) {
+        if (!mEnabled) return true;
         final FeatureRule rule = mRules.get(featureId);
         if (rule == null) {
             Slog.i(TAG, "isAllowedLocked: Empty feature rule");
@@ -398,6 +440,7 @@ public final class FeatureGateService extends SystemService {
         @Override
         public void setRule(FeatureRule rule) {
             enforceManagePermission("setRule"); // 1. Permission first
+            enforceEnabled();
             if (rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty()
                     || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) {
                 throw new IllegalArgumentException("invalid rule: " + rule);
@@ -422,6 +465,7 @@ public final class FeatureGateService extends SystemService {
         @Override // Binder call: admin only
         public void removeRule(String featureId) {
             enforceManagePermission("removeRule");
+            enforceEnabled();
             mCatalog.enforceValid(featureId);
 
             final ArrayMap<String, Boolean> changes;
@@ -448,6 +492,7 @@ public final class FeatureGateService extends SystemService {
             if (listener == null) {
                 throw new IllegalArgumentException("listener is null");
             }
+            enforceEnabled();
             mListeners.register(listener);
         }
 
@@ -465,6 +510,7 @@ public final class FeatureGateService extends SystemService {
 
             synchronized (mLock) {
                 pw.println("FeatureGate state: ");
+                pw.print(" enabled: " + mEnabled);
                 pw.println(" battery: " + (mBatteryKnown ? mBatteryPercent + "%" : "unknown")
                         + ", charging: " + mCharging);
                 pw.println(" rules (" + mRules.size() + "):");

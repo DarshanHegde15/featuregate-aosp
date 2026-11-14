@@ -1,7 +1,7 @@
 From 84a48e1978a8481c4a9c434e2e2de9be3995035f Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Sat, 17 Oct 2026 17:59:28 +0530
-Subject: [PATCH 02/13] FeatureGate: add FeatureGateService and
+Subject: [PATCH 02/14] FeatureGate: add FeatureGateService and
  FeatureGateManager
 
 FeatureGateService runs in system_server, published as 'feature_gate'.

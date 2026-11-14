@@ -12,6 +12,7 @@ import android.app.featuregate.IFeatureGateListener;
 interface IFeatureGateManager {
     /** Error code for SystemSpecificException: no rule exists for this feature */
     const int ERROR_UNKNOWN_FEATURE = 1;
+    const int ERROR_SERVICE_DISABLED = 2;
 
     //---- Quaries: Open to all apps ----
     boolean isFeatureAllowed(String featureId);

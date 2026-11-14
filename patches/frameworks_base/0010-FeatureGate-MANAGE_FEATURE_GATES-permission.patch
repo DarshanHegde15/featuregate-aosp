@@ -1,7 +1,7 @@
 From 1d7c5bfe4de193ef19dd7c0c8c3eb3fb401bd8ab Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Mon, 2 Nov 2026 08:05:44 +0530
-Subject: [PATCH 10/13] FeatureGate: MANAGE_FEATURE_GATES permission
+Subject: [PATCH 10/14] FeatureGate: MANAGE_FEATURE_GATES permission
 
 Declares android.permission.MANAGE_FEATURE_GATES (@hide,
 signature|privileged) and enforces it in setRule/removeRule with

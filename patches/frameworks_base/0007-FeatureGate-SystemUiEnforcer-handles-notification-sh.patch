@@ -1,7 +1,7 @@
 From 6b8ffe62480ad650ad3fd2d60519741c6fda4a1c Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Thu, 29 Oct 2026 07:29:23 +0530
-Subject: [PATCH 07/13] FeatureGate: SystemUiEnforcer handles notification
+Subject: [PATCH 07/14] FeatureGate: SystemUiEnforcer handles notification
  shade
 
 - notification_shade -> DISABLE_EXPAND plus DISABLE2_NOTIFICATION_SHADE

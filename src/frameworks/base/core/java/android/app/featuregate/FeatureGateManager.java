@@ -127,10 +127,11 @@ public class FeatureGateManager {
 
     /** Turns the service's error into a normal Java exception for apps. */
     private static RuntimeException translate(ServiceSpecificException e) {
-        if(e.errorCode == IFeatureGateManager.ERROR_UNKNOWN_FEATURE) {
-            return new IllegalArgumentException(e.getMessage());
+        switch (e.errorCode) {
+            case IFeatureGateManager.ERROR_UNKNOWN_FEATURE: return new IllegalArgumentException(e.getMessage());
+            case IFeatureGateManager.ERROR_SERVICE_DISABLED: return new IllegalStateException(e.getMessage());
+            default: return new RuntimeException(e);
         }
-        return e;
     }
 
     /** Receives feature state changes. Plain Java interface: apps never see AIDL. */

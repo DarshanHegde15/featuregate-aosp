@@ -1,7 +1,7 @@
 From c4954abe271a4a374a06ca8ed2862d57d88f6c38 Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Sat, 31 Oct 2026 12:21:25 +0530
-Subject: [PATCH 08/13] FeatureGate: BlockedNotifier toast
+Subject: [PATCH 08/14] FeatureGate: BlockedNotifier toast
 
 Shows 'Blocked by FeatureGate: <feature> (<reason>)' on system_server's
 shared UiThread, rate-limited per feature with elapsedRealtime().

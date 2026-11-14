@@ -1,7 +1,7 @@
 From 807f6567d094545431dfeb879c9a5c7832b121e9 Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Wed, 28 Oct 2026 07:27:51 +0530
-Subject: [PATCH 05/13] FeatureGate: internal API and enforcer framework
+Subject: [PATCH 05/14] FeatureGate: internal API and enforcer framework
 
 - FeatureGateInternal published via publishLocalService for in-process
   callers (preventive hooks); mLock is a leaf lock, so it is safe to call

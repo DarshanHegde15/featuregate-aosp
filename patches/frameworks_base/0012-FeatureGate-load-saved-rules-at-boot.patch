@@ -1,7 +1,7 @@
 From 06c903a03bdb6dbc9d98800137243ed921de0e71 Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Thu, 5 Nov 2026 15:53:29 +0530
-Subject: [PATCH 12/13] FeatureGate: load saved rules at boot
+Subject: [PATCH 12/14] FeatureGate: load saved rules at boot
 
 Rules are read in onStart() before the binder is published, so callers
 never see an empty rule set. A missing, corrupt or newer-version file

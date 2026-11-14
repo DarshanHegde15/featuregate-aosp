@@ -1,7 +1,7 @@
 From 109736fc260e02c87a9bc73c43ed566112ab29f9 Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Fri, 6 Nov 2026 17:55:28 +0530
-Subject: [PATCH 13/13] FeatureGate: ongoing notification listing restricted
+Subject: [PATCH 13/14] FeatureGate: ongoing notification listing restricted
  features
 
 RestrictionNotifier keeps one low-importance ongoing notification

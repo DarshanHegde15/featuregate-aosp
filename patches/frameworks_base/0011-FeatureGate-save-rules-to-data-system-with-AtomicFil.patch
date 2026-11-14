@@ -1,7 +1,7 @@
 From de9791a687149a6cf14394e1f49ce7d3c5fc0ad2 Mon Sep 17 00:00:00 2001
 From: Darshan Hegde <darshanhegde1156@gmail.com>
 Date: Thu, 5 Nov 2026 05:05:06 +0530
-Subject: [PATCH 11/13] FeatureGate: save rules to /data/system with AtomicFile
+Subject: [PATCH 11/14] FeatureGate: save rules to /data/system with AtomicFile
 
 FeatureGateStore writes rules as binary XML (with a version attribute)
 using AtomicFile, so a crash mid-write never corrupts the file. Writes
