@@ -118,7 +118,7 @@ adb shell dumpsys battery reset
 
 Personal learning project, built step by step. See the commit history in `patches/` for how it grew.
 
-Planned: an on/off switch in the Settings app, Perfetto trace sections and boot-cost measurement, Battery Saver as a condition, unit tests.
+Planned: Perfetto trace sections and boot-cost measurement, Battery Saver as a condition, unit tests.
 
 ## License
 
