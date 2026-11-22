@@ -23,6 +23,7 @@ export_patches() {   # $1 = AOSP project path, $2 = folder name under patches/
 export_patches frameworks/base frameworks_base
 export_patches system/sepolicy system_sepolicy
 export_patches build/soong build_soong
+export_patches packages/apps/Settings packages_apps_Settings
 
 # Snapshot of the new files, at their AOSP paths
 rm -rf "$REPO/src"

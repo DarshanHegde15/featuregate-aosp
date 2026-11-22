@@ -8,6 +8,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 (cd "$AOSP/frameworks/base" && git am "$REPO"/patches/frameworks_base/*.patch)
 (cd "$AOSP/system/sepolicy" && git am "$REPO"/patches/system_sepolicy/*.patch)
+(cd "$AOSP/packages/apps/Settings" && git am "$REPO"/patches/packages_apps_Settings/*.patch)
 cp -r "$REPO/app/FeatureGateConsole" "$AOSP/packages/apps/"
 
 echo "Applied. Build the app with: m FeatureGateConsole"
