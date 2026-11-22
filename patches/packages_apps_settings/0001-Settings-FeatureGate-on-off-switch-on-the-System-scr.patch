@@ -1,0 +1,91 @@
+From 56b6962be1889e7538d5a49ce591fe23d17dc3a3 Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <darshanhegde1156@gmail.com>
+Date: Sun, 22 Nov 2026 15:49:40 +0530
+Subject: [PATCH] Settings: FeatureGate on/off switch on the System screen
+
+TogglePreferenceController writes Settings.Global.FEATURE_GATE_ENABLED;
+the switch is shown only when the feature_gate service exists.
+
+Change-Id: I23166dcb56b9c9d54042d7c05453afb316403420
+---
+ res/values/strings.xml                        |  4 +++
+ res/xml/system_dashboard_fragment.xml         |  8 +++++
+ .../FeatureGatePreferenceController.java      | 33 +++++++++++++++++++
+ 3 files changed, 45 insertions(+)
+ create mode 100644 src/com/android/settings/system/FeatureGatePreferenceController.java
+
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index db679d7e5da..b37c0bc3047 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -13918,4 +13918,8 @@
+     <string name="search_gesture_feature_title">Circle to Search</string>
+     <!-- Summary text for press and hold nav handle OR home button to invoke Circle to Search. [CHAR LIMIT=NONE] -->
+     <string name="search_gesture_feature_summary">Touch and hold the Home button or the navigation handle to search using the content on your screen.</string>
++
++    <!-- FeatureGate on/off switch on the System screen -->
++    <string name="feature_gate_title">FeatureGate</string>
++    <string name="feature_gate_summary">Restrict features based on battery level</string>
+ </resources>
+diff --git a/res/xml/system_dashboard_fragment.xml b/res/xml/system_dashboard_fragment.xml
+index 83cdf64fc00..307087e162e 100644
+--- a/res/xml/system_dashboard_fragment.xml
++++ b/res/xml/system_dashboard_fragment.xml
+@@ -62,6 +62,14 @@
+         android:fragment="com.android.settings.datetime.DateTimeSettings"
+         settings:controller="com.android.settings.datetime.DateTimePreferenceController"/>
+ 
++    <SwitchPreferenceCompat
++        android:key="feature_gate_enabled"
++        android:title="@string/feature_gate_title"
++        android:summary="@string/feature_gate_summary"
++        android:order="100"
++        settings:controller="com.android.settings.system.FeatureGatePreferenceController"
++        />
++
+     <!-- System updates -->
+     <Preference
+         android:key="additional_system_update_settings"
+diff --git a/src/com/android/settings/system/FeatureGatePreferenceController.java b/src/com/android/settings/system/FeatureGatePreferenceController.java
+new file mode 100644
+index 00000000000..f5d26f7b2a4
+--- /dev/null
++++ b/src/com/android/settings/system/FeatureGatePreferenceController.java
+@@ -0,0 +1,33 @@
++package com.android.settings.system;
++
++import android.content.Context;
++import android.provider.Settings;
++import com.android.settings.R;
++import com.android.settings.core.TogglePreferenceController;
++
++public class FeatureGatePreferenceController extends TogglePreferenceController {
++    public FeatureGatePreferenceController(Context context, String key) {
++        super(context, key); // exact constructor the fragment creates
++    }
++
++    @Override
++    public int getAvailabilityStatus() {
++        // Only show the switch on builds that have the featuregate service.
++        return mContext.getSystemService(Context.FEATURE_GATE_SERVICE) != null ? AVAILABLE : UNSUPPORTED_ON_DEVICE;
++    }
++
++    @Override
++    public boolean isChecked() {
++        return Settings.Global.getInt(mContext.getContentResolver(), Settings.Global.FEATURE_GATE_ENABLED, 0) == 1;
++    }
++
++    @Override
++    public boolean setChecked(boolean isChecked) {
++        return Settings.Global.putInt(mContext.getContentResolver(), Settings.Global.FEATURE_GATE_ENABLED, isChecked ? 1 : 0);
++    }
++
++    @Override
++    public int getSliceHighlightMenuRes() {
++        return R.string.menu_key_system; // which menu Settings search highlights
++    }
++}
+\ No newline at end of file
+-- 
+2.53.0
+
