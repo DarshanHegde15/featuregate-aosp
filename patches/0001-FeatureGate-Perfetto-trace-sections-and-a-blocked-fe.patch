@@ -1,0 +1,312 @@
+From b1ff5f3501092ad41391b423a46baf1c98f6e6de Mon Sep 17 00:00:00 2001
+From: Darshan Hegde <96007698+DarshanHegde15@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:25:10 +0530
+Subject: [PATCH] FeatureGate: Perfetto trace sections and a blocked-features
+ counter
+
+Sections for battery/setting changes, notify and each enforcer, binder
+setRule/removeRule, rule writes (IoThread) and rule loading at boot,
+under TRACE_TAG_SYSTEM_SERVER (atrace category 'ss').
+
+Change-Id: I08aac3078e2ad1aaf642e90e483f1be8cbfc5982
+---
+ .../featuregate/FeatureGateService.java       | 195 +++++++++++-------
+ 1 file changed, 115 insertions(+), 80 deletions(-)
+
+diff --git a/services/core/java/com/android/server/featuregate/FeatureGateService.java b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+index 0d0eabbce847..28d765e7d063 100644
+--- a/services/core/java/com/android/server/featuregate/FeatureGateService.java
++++ b/services/core/java/com/android/server/featuregate/FeatureGateService.java
+@@ -39,6 +39,7 @@ import java.io.FileDescriptor;
+ import java.io.PrintWriter;
+ 
+ import com.android.server.LocalServices;
++import android.os.Trace;
+ public final class FeatureGateService extends SystemService {
+     private static final String TAG = "FeatureGateService";
+ 
+@@ -82,6 +83,7 @@ public final class FeatureGateService extends SystemService {
+     private final AppEnforcer mAppEnforcer;
+     // From Settings.Global.FEATURE_GATE_ENABLED. Off until read at phase 500
+     private boolean mEnabled;
++    private static final long TRACE_TAG = Trace.TRACE_TAG_SYSTEM_SERVER;
+ 
+     private final BroadcastReceiver mBatteryReceiver = new BroadcastReceiver() {
+         @Override
+@@ -113,19 +115,24 @@ public final class FeatureGateService extends SystemService {
+     }
+ 
+     private void loadRules() {
+-        final List<FeatureRule> saved = mStore.readRules();
+-        int skipped = 0;
+-        synchronized (mLock) {
+-            for (FeatureRule r : saved) {
+-                if (isValidSavedRule(r)) {
+-                    mRules.put(r.getFeatureId(), r);
+-                } else {
+-                    skipped++;
++        Trace.traceBegin(TRACE_TAG, "FG:loadRules");
++        try {
++            final List<FeatureRule> saved = mStore.readRules();
++            int skipped = 0;
++            synchronized (mLock) {
++                for (FeatureRule r : saved) {
++                    if (isValidSavedRule(r)) {
++                        mRules.put(r.getFeatureId(), r);
++                    } else {
++                        skipped++;
++                    }
++                }
++                if(skipped > 0) {
++                    Slog.w(TAG, "Skipped " + skipped + " invalid saved rules");
+                 }
+             }
+-            if(skipped > 0) {
+-                Slog.w(TAG, "Skipped " + skipped + " invalid saved rules");
+-            }
++        } finally {
++            Trace.traceEnd(TRACE_TAG);
+         }
+     }
+ 
+@@ -168,19 +175,24 @@ public final class FeatureGateService extends SystemService {
+ 
+     // Called at phase 500 and whenever the setings changes (on mHandler).
+     private void onEnabledSettingsChanged() {
+-        // Read outside the lock: it's a call into SettingsProvider.
+-        final boolean enabled = Settings.Global.getInt(getContext().getContentResolver(),Settings.Global.FEATURE_GATE_ENABLED, 0) == 1;
++        Trace.traceBegin(TRACE_TAG, "FG:onSettingsChanged");
++        try{
++            // Read outside the lock: it's a call into SettingsProvider.
++            final boolean enabled = Settings.Global.getInt(getContext().getContentResolver(),Settings.Global.FEATURE_GATE_ENABLED, 0) == 1;
+ 
+-        final ArrayMap<String, Boolean> changes;
+-        synchronized (mLock) {
+-            if (enabled == mEnabled) return;
+-            final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
+-            final ArrayMap<String, Boolean> before = snapshotLocked(ids);
+-            mEnabled = enabled;
+-            changes = diffLocked(ids, before);
+-        }
+-        Slog.i(TAG,"FeatureGate " + (enabled ? "enabled" : "disabled") + " by Settings");
+-        notifyListenerAsync(changes);
++            final ArrayMap<String, Boolean> changes;
++            synchronized (mLock) {
++                if (enabled == mEnabled) return;
++                final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
++                final ArrayMap<String, Boolean> before = snapshotLocked(ids);
++                mEnabled = enabled;
++                changes = diffLocked(ids, before);
++            }
++            Slog.i(TAG,"FeatureGate " + (enabled ? "enabled" : "disabled") + " by Settings");
++            notifyListenerAsync(changes);
++        } finally {
++            Trace.traceEnd(TRACE_TAG);
++        }
+     }
+ 
+     private void enforceEnabled() {
+@@ -220,32 +232,37 @@ public final class FeatureGateService extends SystemService {
+ 
+     /** Runs on mHandler */
+     private void onBatteryIntent(Intent intent) {
+-        final int level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+-        final int scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+-        final int plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
++        Trace.traceBegin(TRACE_TAG, "FG:onBattery");
++        try {
++            final int level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
++            final int scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
++            final int plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+ 
+-        if (level < 0 || scale <= 0) {
+-            return;
+-        }
++            if (level < 0 || scale <= 0) {
++                return;
++            }
+ 
+-        final int percent = level * 100 / scale;
+-        final boolean charging = plugged != 0;
+-        final ArrayMap<String, Boolean> changes;
++            final int percent = level * 100 / scale;
++            final boolean charging = plugged != 0;
++            final ArrayMap<String, Boolean> changes;
+ 
+-        synchronized (mLock) {
+-            if (mBatteryKnown && percent == mBatteryPercent && charging == mCharging) {
+-                return; // nothing we use changed (temperature/voltag-only update
+-            }
++            synchronized (mLock) {
++                if (mBatteryKnown && percent == mBatteryPercent && charging == mCharging) {
++                    return; // nothing we use changed (temperature/voltag-only update
++                }
+ 
+-            final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
+-            final ArrayMap<String, Boolean> before = snapshotLocked(ids);
+-            mBatteryPercent = percent;
+-            mCharging = charging;
+-            mBatteryKnown = true;
+-            changes = diffLocked(ids, before);
++                final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
++                final ArrayMap<String, Boolean> before = snapshotLocked(ids);
++                mBatteryPercent = percent;
++                mCharging = charging;
++                mBatteryKnown = true;
++                changes = diffLocked(ids, before);
++            }
++            Slog.i(TAG, "onBatteryIntent: battery " + percent + "% charging " + charging);
++            notifyListenerAsync(changes);
++        } finally {
++            Trace.traceEnd(TRACE_TAG);
+         }
+-        Slog.i(TAG, "onBatteryIntent: battery " + percent + "% charging " + charging);
+-        notifyListenerAsync(changes);
+     }
+ 
+     @GuardedBy("mLock")
+@@ -299,6 +316,7 @@ public final class FeatureGateService extends SystemService {
+ 
+     /** Runs only on mHandler, so braodcasts never overlap and stay in order. */
+     private void notifyListeners(ArrayMap<String, Boolean> changes) {
++        Trace.traceBegin(TRACE_TAG, "FG:notify");
+         dispatchToEnforcers(changes);
+         for (int j = 0; j < changes.size(); j++) {
+             Slog.i(TAG, "notifyListeners: " + changes.keyAt(j) + " -> " + (changes.valueAt(j)
+@@ -320,6 +338,7 @@ public final class FeatureGateService extends SystemService {
+             }
+         } finally {
+             mListeners.finishBroadcast();
++            Trace.traceEnd(TRACE_TAG);
+         }
+         updateRestrictionNotification();
+     }
+@@ -374,10 +393,15 @@ public final class FeatureGateService extends SystemService {
+     // Runs on IoThread. Snapshot under the lock, write outside it.
+     private void writeRulesNow() {
+         final List<FeatureRule> snapshot;
+-        synchronized (mLock) {
+-            snapshot = new ArrayList<>(mRules.values());
++        Trace.traceBegin(TRACE_TAG, "FG:writeRules");
++        try {
++            synchronized (mLock) {
++                snapshot = new ArrayList<>(mRules.values());
++            }
++            mStore.writeRules(snapshot);
++        } finally {
++            Trace.traceEnd(TRACE_TAG);
+         }
+-        mStore.writeRules(snapshot);
+     }
+ 
+     // Runs on mHandler. Posts, updates or cancels the ongoing notification.
+@@ -396,6 +420,7 @@ public final class FeatureGateService extends SystemService {
+         }
+ 
+         mRestrictionNotifier.update(blocked); // Outside the lock: It's a binder call to NMS
++        Trace.traceCounter(TRACE_TAG, "FG:blockedFeatures", blocked.size());
+     }
+ 
+     private final class LocalService extends FeatureGateInternal {
+@@ -439,47 +464,57 @@ public final class FeatureGateService extends SystemService {
+ 
+         @Override
+         public void setRule(FeatureRule rule) {
+-            enforceManagePermission("setRule"); // 1. Permission first
+-            enforceEnabled();
+-            if (rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty()
+-                    || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) {
+-                throw new IllegalArgumentException("invalid rule: " + rule);
+-            }
++            Trace.traceBegin(TRACE_TAG, "FG:setRule");
++            try {
++                enforceManagePermission("setRule"); // 1. Permission first
++                enforceEnabled();
++                if (rule == null || rule.getFeatureId() == null || rule.getFeatureId().isEmpty()
++                        || rule.getMinBatteryPercent() < 0 || rule.getMinBatteryPercent() > 100) {
++                    throw new IllegalArgumentException("invalid rule: " + rule);
++                }
+ 
+-            mCatalog.enforceValid(rule.getFeatureId()); // 2. Then validate, outside the lock
++                mCatalog.enforceValid(rule.getFeatureId()); // 2. Then validate, outside the lock
+ 
+-            final ArrayMap<String, Boolean> changes;
++                final ArrayMap<String, Boolean> changes;
+ 
+-            synchronized (mLock) {
+-                final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
+-                ids.add(rule.getFeatureId());
+-                final ArrayMap<String, Boolean> before = snapshotLocked(ids);
+-                mRules.put(rule.getFeatureId(), rule);
+-                changes = diffLocked(ids, before);
++                synchronized (mLock) {
++                    final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
++                    ids.add(rule.getFeatureId());
++                    final ArrayMap<String, Boolean> before = snapshotLocked(ids);
++                    mRules.put(rule.getFeatureId(), rule);
++                    changes = diffLocked(ids, before);
++                }
++                Slog.i(TAG, "setRule " + rule + " by uid " + Binder.getCallingUid());
++                notifyListenerAsync(changes);
++                scheduleWrite();
++            } finally {
++                Trace.traceEnd(TRACE_TAG);
+             }
+-            Slog.i(TAG, "setRule " + rule + " by uid " + Binder.getCallingUid());
+-            notifyListenerAsync(changes);
+-            scheduleWrite();
+         }
+ 
+         @Override // Binder call: admin only
+         public void removeRule(String featureId) {
+-            enforceManagePermission("removeRule");
+-            enforceEnabled();
+-            mCatalog.enforceValid(featureId);
+-
+-            final ArrayMap<String, Boolean> changes;
+-
+-            synchronized (mLock) {
+-                final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
+-                ids.add(featureId);
+-                final ArrayMap<String, Boolean> before = snapshotLocked(ids);
+-                mRules.remove(featureId);
+-                changes = diffLocked(ids, before);
++            Trace.traceBegin(TRACE_TAG, "FG:removeRule");
++            try {
++                enforceManagePermission("removeRule");
++                enforceEnabled();
++                mCatalog.enforceValid(featureId);
++
++                final ArrayMap<String, Boolean> changes;
++
++                synchronized (mLock) {
++                    final ArraySet<String> ids = new ArraySet<>(mRules.keySet());
++                    ids.add(featureId);
++                    final ArrayMap<String, Boolean> before = snapshotLocked(ids);
++                    mRules.remove(featureId);
++                    changes = diffLocked(ids, before);
++                }
++                Slog.i(TAG, "removeRule " + featureId + " by uid " + Binder.getCallingUid());
++                notifyListenerAsync(changes);
++                scheduleWrite();
++            } finally {
++                Trace.traceEnd(TRACE_TAG);
+             }
+-            Slog.i(TAG, "removeRule " + featureId + " by uid " + Binder.getCallingUid());
+-            notifyListenerAsync(changes);
+-            scheduleWrite();
+         }
+ 
+         @Override
+@@ -510,7 +545,7 @@ public final class FeatureGateService extends SystemService {
+ 
+             synchronized (mLock) {
+                 pw.println("FeatureGate state: ");
+-                pw.print(" enabled: " + mEnabled);
++                pw.println(" enabled: " + mEnabled);
+                 pw.println(" battery: " + (mBatteryKnown ? mBatteryPercent + "%" : "unknown")
+                         + ", charging: " + mCharging);
+                 pw.println(" rules (" + mRules.size() + "):");
+-- 
+2.53.0
+
